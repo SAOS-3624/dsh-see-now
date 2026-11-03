@@ -42,18 +42,32 @@ test('包里必须自带 window.py（发版兜底，不能只靠兄弟仓库）'
   assert.match(text, /生成的|sync-window\.mjs/, '要带 GENERATED 标记，防止有人手改这份');
 });
 
-test('包内那份是合法的 Python（语法能过）', () => {
-  // 不 import tkinter、不建窗口，只让解释器 `compile()` 一遍：
-  // 同步截断 / 编码坏掉都能在这一步现形。
-  const probe = spawnSync('python', ['-c',
-    'import ast,sys;ast.parse(open(sys.argv[1],encoding="utf-8").read());print("ok")',
-    PACKAGED], { encoding: 'utf8', windowsHide: true, timeout: 15000 });
-  if (probe.error || probe.status === null) {
-    // 机器上没有能用的 python：跳过而不是假失败（真机上它会被 window.js 的 tkinter 探测挡掉）
-    return;
+test('包内那份是合法的 Python（语法能过）', (t) => {
+  let probe;
+  for (const python of ['python3', 'python']) {
+    probe = spawnSync(python, ['-c',
+      'import ast,sys;ast.parse(open(sys.argv[1],encoding="utf-8").read());print("ok")',
+      PACKAGED], { encoding: 'utf8', windowsHide: true, timeout: 15000 });
+    if (!probe.error && probe.status !== null) break;
   }
+  if (probe.error || probe.status === null) return t.skip('未找到可运行的 Python');
   assert.equal(probe.status, 0, `语法检查失败：${probe.stderr || probe.stdout}`);
   assert.match(probe.stdout, /ok/);
+});
+
+test('macOS 独立入口只用标准库，不导入 Windows 窗口', () => {
+  const entry = join(ROOT, 'examples', 'floating-chat', 'macos-window.py');
+  const ui = join(ROOT, 'examples', 'floating-chat', 'macos.py');
+  const text = readFileSync(entry, 'utf8');
+  assert.match(text, /DSH_SEE_WINDOW_PROTOCOL = 1/);
+  assert.match(text, /DSH_SEE_WINDOW_COMMANDS = 1/);
+  assert.doesNotMatch(text, /from window|import window|PIL|ctypes|mss/);
+  for (const path of [entry, ui]) {
+    const result = spawnSync('python3', ['-c',
+      'import ast,sys;ast.parse(open(sys.argv[1],encoding="utf-8").read())', path],
+      { encoding: 'utf8', timeout: 15000 });
+    assert.equal(result.status, 0, result.stderr);
+  }
 });
 
 test('回退链：显式指定 > 配置 > 已安装 > 开发仓库 > 包内', () => {
@@ -66,14 +80,14 @@ test('回退链：显式指定 > 配置 > 已安装 > 开发仓库 > 包内', ()
   const explicit = join(fakeEnv.root, 'custom.py');
   writeFileSync(explicit, 'print(1)\n', 'utf8');
   assert.equal(
-    resolveScript({ env: { ...fakeEnv.env, DSH_SEE_WINDOW: explicit } }).from,
+    resolveScript({ platform: 'win32', env: { ...fakeEnv.env, DSH_SEE_WINDOW: explicit } }).from,
     'DSH_SEE_WINDOW',
   );
 
   // 2. ~/.dsh/see-window.json
   writeJson(join(fakeEnv.home, 'see-window.json'), { script: explicit });
   assert.equal(
-    resolveScript({ env: fakeEnv.env }).from,
+    resolveScript({ platform: 'win32', env: fakeEnv.env }).from,
     '~/.dsh/see-window.json',
     '配置文件该比已安装的包优先',
   );
@@ -81,20 +95,20 @@ test('回退链：显式指定 > 配置 > 已安装 > 开发仓库 > 包内', ()
   // 3. ~/.dsh/watch-window.json
   writeJson(join(fakeEnv.home, 'see-window.json'), {});
   writeJson(join(fakeEnv.home, 'watch-window.json'), { script: explicit });
-  assert.equal(resolveScript({ env: fakeEnv.env }).from, '~/.dsh/watch-window.json');
+  assert.equal(resolveScript({ platform: 'win32', env: fakeEnv.env }).from, '~/.dsh/watch-window.json');
 
   // 4. 已安装的包（要能扫到 web 这种非 desktop 的 profile）
   writeJson(join(fakeEnv.home, 'watch-window.json'), {});
   const inst = join(fakeEnv.home, 'profiles', 'web', 'node_modules', 'dsh-watch-together', REL);
   mkdirSync(dirname(inst), { recursive: true });
   writeFileSync(inst, 'print(2)\n', 'utf8');
-  const found = resolveScript({ env: fakeEnv.env });
+  const found = resolveScript({ platform: 'win32', env: fakeEnv.env });
   assert.equal(found.from, '已安装的 watch-together');
   assert.equal(found.script, inst, 'profile 名不能硬编码成 desktop');
 
   // 5. 都没有 → 包内（开发机上就是这一层兜底）
   const bare = mkHome({});
-  const last = resolveScript({ env: bare.env });
+  const last = resolveScript({ platform: 'win32', env: bare.env });
   if (last.from === '开发仓库') {
     // 开发机上有兄弟仓库，它排在包内前面，这是对的
     assert.equal(last.script, join(ROOT, '..', 'dsh-watch-together', REL));
@@ -107,7 +121,7 @@ test('回退链：显式指定 > 配置 > 已安装 > 开发仓库 > 包内', ()
 test('空环境里 resolveScript 不会抛异常', () => {
   const bare = mkHome({});
   const r = resolveScript({ env: bare.env });
-  assert.ok(r.from === '包内' || r.from === '开发仓库', `意外的来源：${r.from}`);
+  assert.ok(r.from === '包内' || r.from === '开发仓库' || r.from === 'macOS 独立窗口', `意外的来源：${r.from}`);
   assert.ok(existsSync(r.script), 'resolve 出来的路径必须真的存在');
 });
 
@@ -122,5 +136,5 @@ function mkHome(extra) {
 
 function writeJson(p, obj) {
   mkdirSync(dirname(p), { recursive: true });
-  writeFileSync(p, JSON.stringify(obj), 'utf8');
+  writeFileSync(p, JSON.stringify(obj, null, 2), 'utf8');
 }
