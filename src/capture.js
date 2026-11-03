@@ -49,6 +49,82 @@ export const DEFAULT_SCREEN_DEVICE = 'Capture screen 0';
 export const SCREEN_PERMISSION_HINT =
   'ffmpeg 没有「屏幕录制」权限：系统设置 → 隐私与安全性 → 屏幕录制，勾上跑 DSH 的那个 App（或终端），重启它再试。';
 
+/** 区域参数校验。gdigrab 允许虚拟桌面跨屏的负坐标，其它引擎要求非负整数。 */
+export function checkRegion(region, { allowNegative = false } = {}) {
+  if (!region) return;
+  const { x, y, w, h } = region;
+  if (![x, y, w, h].every(Number.isInteger) || w <= 0 || h <= 0 || (!allowNegative && (x < 0 || y < 0))) {
+    throw new RangeError('region 必须使用物理像素整数坐标，且宽高为正数');
+  }
+}
+
+/** 保留底层证据；只有明确的 stderr 才归类权限或设备错误。 */
+export function captureErrorInfo(error, stage = 'exit') {
+  if (error?.errorInfo) return error.errorInfo;
+  const message = String(error?.message ?? error);
+  const category = error?.code === 'ENOENT' || /找不到 FFmpeg|spawn.*ENOENT/i.test(message) ? 'dependency-missing'
+    : error instanceof RangeError ? 'invalid-input'
+      : /permission denied|not authorized|operation not permitted|screen recording permission/i.test(message) ? 'permission-denied'
+        : /device.*(?:not found|invalid)|invalid.*device|could not find.*device|video device.*not available/i.test(message) ? 'device-unavailable'
+          : 'capture-failed';
+  return { category, stage, code: error?.code ?? null, signal: error?.signal ?? null, stderrTail: error?.stderrTail ?? null };
+}
+
+/** 有界枚举设备；FFmpeg 的 list_devices 会主动退出，不进入采集。 */
+export async function listDevices({
+  ffmpegPath = 'ffmpeg', platform = process.platform, timeoutMs = 3000, spawnProcess = spawn,
+} = {}) {
+  if (!['darwin', 'win32'].includes(platform)) throw new RangeError(`${platform} 暂无设备枚举实现`);
+  const input = platform === 'darwin' ? 'avfoundation' : 'dshow';
+  const args = ['-hide_banner', '-list_devices', 'true', '-f', input, '-i', platform === 'darwin' ? '' : 'dummy'];
+  return new Promise((resolveList, rejectList) => {
+    let child;
+    try {
+      child = spawnProcess(ffmpegPath, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    } catch (err) {
+      const wrapped = new Error(`FFmpeg 设备枚举启动失败（${ffmpegPath}）：${err.message}`, { cause: err });
+      wrapped.errorInfo = captureErrorInfo(err, 'spawn');
+      rejectList(wrapped);
+      return;
+    }
+    let stderr = '';
+    let failure = null;
+    const timer = setTimeout(() => {
+      failure = new Error(`FFmpeg 设备枚举超过 ${timeoutMs}ms（${ffmpegPath}）`);
+      try { child.kill('SIGKILL'); } catch { /* 等待 close */ }
+    }, timeoutMs);
+    child.stderr?.on('data', (chunk) => { stderr = `${stderr}${chunk}`.slice(-32_000); });
+    child.on('error', (error) => {
+      failure = new Error(`FFmpeg 设备枚举启动失败（${ffmpegPath}）：${error.message}`, { cause: error });
+      failure.errorInfo = captureErrorInfo(error, 'spawn');
+    });
+    child.on('close', (code, signal) => {
+      clearTimeout(timer);
+      if (failure) { rejectList(failure); return; }
+      const devices = [];
+      let audio = false;
+      for (const line of stderr.split(/\r?\n/)) {
+        if (/AVFoundation audio devices/i.test(line)) audio = true;
+        if (platform === 'darwin') {
+          const match = line.match(/\[(\d+)\]\s+(.+?)\s*$/);
+          if (match) devices.push({ index: Number(match[1]), name: match[2], kind: audio ? 'audio' : /^Capture screen \d+$/.test(match[2]) ? 'screen' : 'camera' });
+        } else {
+          const match = line.match(/"(.+)"\s+\((video|audio)\)/);
+          if (match) devices.push({ index: devices.filter((d) => (d.kind === 'audio') === (match[2] === 'audio')).length, name: match[1], kind: match[2] === 'audio' ? 'audio' : 'camera' });
+        }
+      }
+      if (!devices.length) {
+        const err = new Error(`FFmpeg 未返回设备（${ffmpegPath}，code=${code}，signal=${signal ?? 'none'}）：${stderr.trim().slice(-1000) || '无输出'}`);
+        err.stderrTail = stderr.trim().slice(-1000) || null;
+        err.errorInfo = captureErrorInfo(err, 'exit');
+        rejectList(err);
+        return;
+      }
+      resolveList({ ffmpegPath, platform, devices, stderr });
+    });
+  });
+}
+
 /** 源描述 → 输入参数。纯函数，可单测。 */
 export function sourceArgs(
   source = { kind: 'screen' },
@@ -71,31 +147,34 @@ export function sourceArgs(
         '-f', 'dshow', '-i', `video=${device}`];
     }
     case 'screen': {
-      if (mac || s.engine === 'avfoundation' || engine === 'avfoundation') {
-        // ① 屏幕合成不走 GPU 路径，只能靠 AVFoundation 推流；
-        // ② `-capture_cursor` 必须显式给（默认值随系统版本变，不能靠）；
-        // ③ 音频写 `none`，否则某些系统会去开麦克风，触发额外的权限弹窗；
-        // ④ `-pixel_format` 不给就默认 yuv420p，而屏幕输入**不支持** yuv420p ——
-        //    每进程刷一行 "not supported" 到 stderr。探针会挑一个设备真收的格式，
-        //    顺手把那行噪音也消掉（否则真出错时被截断的 300 字里全是它）。
+      if (!['darwin', 'win32'].includes(platform)) {
+        throw new RangeError(
+          `屏幕采集还没接 ${platform}：Windows 走 ddagrab/gdigrab，macOS 走 avfoundation，Linux 需要 x11grab 或 PipeWire，还没做。`,
+        );
+      }
+      const selected = s.engine ?? engine;
+      const useDda = selected === 'ddagrab' || (selected !== 'gdigrab' && engine !== 'gdigrab');
+      const isGdi = !mac && (selected === 'gdigrab' || (!useDda && selected !== 'avfoundation'));
+      checkRegion(s.region, { allowNegative: isGdi });
+      if (mac || selected === 'avfoundation' || engine === 'avfoundation') {
         const pf = s.pixelFormat ?? pixelFormat;
         return ['-f', 'avfoundation', '-framerate', String(fps),
           ...(pf ? ['-pixel_format', pf] : []),
           '-capture_cursor', s.mouse ? '1' : '0',
           '-i', `${s.device ?? DEFAULT_SCREEN_DEVICE}:none`];
       }
-      const useDda = s.engine === 'ddagrab' || (s.engine !== 'gdigrab' && engine !== 'gdigrab');
       if (!useDda) {
         // gdigrab 的 -framerate 是**设备侧**采样率，必须给，否则默认 29.97 白解码
         const region = s.region
           ? ['-offset_x', String(s.region.x), '-offset_y', String(s.region.y),
             '-video_size', `${s.region.w}x${s.region.h}`]
           : [];
-        return ['-f', 'gdigrab', '-framerate', String(fps), '-draw_mouse', '0', ...region,
+        return ['-f', 'gdigrab', '-framerate', String(fps), '-draw_mouse', s.mouse ? '1' : '0', ...region,
           '-i', s.desktop ?? 'desktop'];
       }
       // ddagrab 是 filter source，输入侧没有帧率参数
-      return ['-f', 'lavfi', '-i', `ddagrab=framerate=${fps}:draw_mouse=${s.mouse ? 1 : 0}`];
+      const output = s.device == null ? '' : `:output_idx=${s.device}`;
+      return ['-f', 'lavfi', '-i', `ddagrab=framerate=${fps}:draw_mouse=${s.mouse ? 1 : 0}${output}`];
     }
     case 'file':
       // `realtime` 才加 -re；离线跑要看的是「管线本身多快」，不能被播放速度骗了
@@ -150,7 +229,7 @@ export function captureArgs({
   if (isDda(source, engine, platform)) filters.push('hwdownload', 'format=bgra');
   // avfoundation 没有 gdigrab 那种 `-video_size` 局部抓取，裁剪只能在滤镜里做。
   // 坐标按**采集分辨率**算（Retina 上是逻辑分辨率的 2 倍），不做自动换算。
-  if (source?.kind === 'screen' && (platform === 'darwin' || engineUsed === 'avfoundation') && source?.region) {
+  if (source?.kind === 'screen' && (platform === 'darwin' || engineUsed === 'avfoundation' || engineUsed === 'ddagrab') && source?.region) {
     const r = source.region;
     filters.push(`crop=${r.w}:${r.h}:${r.x}:${r.y}`);
   }
@@ -169,17 +248,19 @@ export function captureArgs({
  * 判帧、留帧、重排都在回调里跑完，绝不让帧在内存里越堆越多。
  *
  * @returns {{stop:()=>void, done:Promise<{frames:number, ms:number, code:number|null}>}}
- */export function spawnFrames({
+ */
+export function spawnFrames({
   source, width, height, fps, ffmpegPath = 'ffmpeg', engine = 'auto',
-  onFrame, onStderr = null, onFirst = null,
+  onFrame, onStderr = null, onFirst = null, spawnProcess = spawn,
 } = {}) {
   const args = captureArgs({ source, width, height, fps, ffmpegPath, engine }).slice(1);
-  const child = spawn(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawnProcess(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
   const need = width * height * 3;
   let pending = null;
   let n = 0;
   const t0 = Date.now();
   let err = '';
+  let stopped = false;
 
   const done = new Promise((resolve, reject) => {
     child.stdout.on('data', (chunk) => {
@@ -198,12 +279,20 @@ export function captureArgs({
       err = `${err}${d}`.slice(-4000);
       onStderr?.(String(d));
     });
-    child.on('error', reject);
-    child.on('close', (code) => {
+    child.on('error', (e) => {
+      e.errorInfo = captureErrorInfo(e, 'spawn');
+      reject(e);
+    });
+    child.on('close', (code, signal) => {
       // `code === null` = 被我们自己 SIGKILL 的（stop / 换清晰度 / 收工）。
       // 那是正常收尾，不是失败 —— 否则每次 stop 都往 lastError 里写一条假错误。
-      if (code !== 0 && code !== null && err.trim()) {
-        reject(new Error(`ffmpeg exit ${code}: ${err.trim().slice(-300)}`));
+      if (!stopped && code !== 0 && code !== null) {
+        const error = new Error(`ffmpeg exit ${code}: ${err.trim().slice(-300) || '无 stderr'}`);
+        error.code = code;
+        error.signal = signal ?? null;
+        error.stderrTail = err.trim().slice(-1000) || null;
+        error.errorInfo = captureErrorInfo(error, 'exit');
+        reject(error);
         return;
       }
       resolve({ frames: n, ms: Date.now() - t0, code });
@@ -213,6 +302,7 @@ export function captureArgs({
   return {
     done,
     stop() {
+      stopped = true;
       try { child.kill('SIGKILL'); } catch { /* 已经没了 */ }
     },
   };
@@ -234,11 +324,13 @@ export function captureArgs({
  * 没权限的时候 ffmpeg 照样 exit 0、照样吐帧，只是全黑 —— 只有看平均像素才知道。
  */
 let cachedEngine = null;
+let cachedEngineKey = null;
 let cachedFormat = null;            // macOS 屏幕像素格式：'' = 用设备默认
 let screenWarning = null;
 
 export function resetScreenEngineCache() {
   cachedEngine = null;
+  cachedEngineKey = null;
   cachedFormat = null;
   screenWarning = null;
 }
@@ -260,21 +352,29 @@ function meanOf(buf) {
 }
 
 export function pickScreenEngine({
-  ffmpegPath = 'ffmpeg', fps = 12, timeoutMs = 2500, platform = process.platform,
+  ffmpegPath = 'ffmpeg', fps = 12, timeoutMs = 2500, platform = process.platform, spawnProcess = spawn,
+  device = DEFAULT_SCREEN_DEVICE,
 } = {}) {
-  if (cachedEngine) return Promise.resolve(cachedEngine);
-  if (platform === 'darwin') return probeAvfoundation({ ffmpegPath, fps, timeoutMs });
+  const key = `${platform}:${ffmpegPath}:${device}`;
+  if (cachedEngine && cachedEngineKey === key) return Promise.resolve(cachedEngine);
+  if (platform === 'darwin') {
+    return probeAvfoundation({ ffmpegPath, fps, timeoutMs, device, spawnProcess }).then((engine) => {
+      cachedEngineKey = key;
+      return engine;
+    });
+  }
   if (platform !== 'win32') {
     return Promise.reject(new RangeError(
       `屏幕采集还没接 ${platform}：Windows 走 ddagrab/gdigrab，macOS 走 avfoundation，Linux 需要 x11grab 或 PipeWire，还没做。`,
     ));
   }
-  return probeDdagrab({ ffmpegPath, fps, timeoutMs });
+  return probeDdagrab({ ffmpegPath, fps, timeoutMs, spawnProcess }).then((engine) => {
+    cachedEngineKey = key;
+    return engine;
+  });
 }
 
-/** macOS：探一次 avfoundation，同时判黑屏（= 没权限）。 */
-/**
- * macOS：探一次 avfoundation —— 一次回答三个问题。
+/** macOS：探一次 avfoundation —— 一次回答三个问题。
  *
  * ① 能不能出帧（ffmpeg 在不在、设备名对不对）；
  * ② **哪个像素格式设备真收**（默认的 yuv420p 屏幕输入不支持，必须自己试）；
@@ -283,12 +383,15 @@ export function pickScreenEngine({
  * 顺序是**按实测 CPU 从省到费**排的（本机 12fps→800×450：nv12 0.14 核 ≈ uyvy422 0.15 ≈
  * 设备默认 0.14，bgr0 0.23）。格式不对时 ffmpeg 会很快报错退出，所以串行试不会拖慢。
  */
-async function probeAvfoundation({ ffmpegPath, fps, timeoutMs }) {
+async function probeAvfoundation({ ffmpegPath, fps, timeoutMs, device = DEFAULT_SCREEN_DEVICE, spawnProcess = spawn }) {
   const W = 64;                      // 探针只取 1 帧，尺寸越小越快
   const H = 36;
   const formats = ['nv12', 'uyvy422', 'bgr0', null];
+  const deadline = Date.now() + timeoutMs;
   for (const pf of formats) {
-    const shot = await grabOneFrame({ ffmpegPath, fps, width: W, height: H, pixelFormat: pf, timeoutMs });
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    const shot = await grabOneFrame({ ffmpegPath, fps, width: W, height: H, pixelFormat: pf, timeoutMs: remaining, device, spawnProcess });
     if (!shot.got) continue;
     cachedEngine = 'avfoundation';
     cachedFormat = pf ?? '';
@@ -303,58 +406,88 @@ async function probeAvfoundation({ ffmpegPath, fps, timeoutMs }) {
   return 'avfoundation';
 }
 
-/** 单帧探针。拿到满一帧就提前 resolve，不等 close。 */
-function grabOneFrame({ ffmpegPath, fps, width, height, pixelFormat, timeoutMs }) {
+/** 单帧探针。拿到满一帧发送 SIGKILL 并等待子进程 close 后 resolve，避免孤儿进程。 */
+function grabOneFrame({ ffmpegPath, fps, width, height, pixelFormat, timeoutMs, device = DEFAULT_SCREEN_DEVICE, spawnProcess = spawn }) {
   const args = captureArgs({
-    source: { kind: 'screen', engine: 'avfoundation', pixelFormat: pixelFormat ?? '' },
-    width, height, fps, ffmpegPath, engine: 'avfoundation',
+    source: { kind: 'screen', device, engine: 'avfoundation', pixelFormat: pixelFormat ?? '' },
+    width, height, fps, ffmpegPath, engine: 'avfoundation', platform: 'darwin',
   }).slice(1);
   args.splice(args.length - 1, 0, '-frames:v', '1');
   const need = width * height * 3;
 
   return new Promise((resolve) => {
-    const child = spawn(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'ignore'] });
+    let child;
+    try {
+      child = spawnProcess(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'ignore'] });
+    } catch {
+      resolve({ got: false, buf: Buffer.alloc(0) });
+      return;
+    }
     let buf = Buffer.alloc(0);
-    let settled = false;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
+    let timer = null;
+    let killed = false;
+
+    const killChild = () => {
+      if (killed) return;
+      killed = true;
+      clearTimeout(timer);
       try { child.kill('SIGKILL'); } catch { /* 已经没了 */ }
-      resolve({ got: buf.length >= need, buf: buf.subarray(0, need) });
     };
-    const timer = setTimeout(finish, timeoutMs);
-    child.stdout.on('data', (d) => {
+
+    timer = setTimeout(killChild, timeoutMs);
+
+    child.stdout?.on('data', (d) => {
       buf = Buffer.concat([buf, d]);
-      if (buf.length >= need) { clearTimeout(timer); finish(); }
+      if (buf.length >= need) killChild();
     });
-    child.on('error', () => { clearTimeout(timer); finish(); });
-    child.on('close', () => { clearTimeout(timer); finish(); });
+    child.on('error', () => { killChild(); });
+    child.on('close', () => {
+      clearTimeout(timer);
+      resolve({ got: buf.length >= need, buf: buf.subarray(0, need) });
+    });
   });
 }
 
 /** Windows：探 ddagrab，不行退 gdigrab。 */
-function probeDdagrab({ ffmpegPath, fps, timeoutMs }) {
+function probeDdagrab({ ffmpegPath, fps, timeoutMs, spawnProcess = spawn }) {
   const W = 64;
   const H = 36;                     // 探针只取 1 帧，尺寸越小越快
   const args = captureArgs({
-    source: { kind: 'screen', engine: 'ddagrab' }, width: W, height: H, fps, ffmpegPath, engine: 'ddagrab',
+    source: { kind: 'screen', engine: 'ddagrab' }, width: W, height: H, fps, ffmpegPath, engine: 'ddagrab', platform: 'win32',
   }).slice(1);
   args.splice(args.length - 1, 0, '-frames:v', '1');
 
   return new Promise((resolve) => {
-    const child = spawn(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'ignore'] });
+    let child;
+    try {
+      child = spawnProcess(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'ignore'] });
+    } catch {
+      resolve('gdigrab');
+      return;
+    }
     let got = 0;
-    const done = (engine) => {
-      cachedEngine = engine;
+    let result = null;
+    let timer = null;
+
+    const finish = (engine) => {
+      if (result) return;
+      result = engine;
+      clearTimeout(timer);
       try { child.kill('SIGKILL'); } catch { /* 已经没了 */ }
-      resolve(engine);
     };
-    const timer = setTimeout(() => done('gdigrab'), timeoutMs);
-    child.stdout.on('data', (d) => {
+
+    timer = setTimeout(() => finish('gdigrab'), timeoutMs);
+
+    child.stdout?.on('data', (d) => {
       got += d.length;
-      if (got >= W * H * 3) { clearTimeout(timer); done('ddagrab'); }
+      if (got >= W * H * 3) finish('ddagrab');
     });
-    child.on('error', () => { clearTimeout(timer); done('gdigrab'); });
-    child.on('close', () => { clearTimeout(timer); if (!got) done('gdigrab'); });
+    child.on('error', () => finish('gdigrab'));
+    child.on('close', () => {
+      clearTimeout(timer);
+      const chosen = result ?? (got >= W * H * 3 ? 'ddagrab' : 'gdigrab');
+      cachedEngine = chosen;
+      resolve(chosen);
+    });
   });
 }

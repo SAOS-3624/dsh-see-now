@@ -9,11 +9,17 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 
 import { createTiers } from '../src/tiers.js';
 import { solve } from '../src/pack.js';
 import { coverInto } from '../src/scale.js';
 import { createPipeline } from '../src/pipeline.js';
+import {
+  checkRegion, listDevices, captureErrorInfo, pickScreenEngine,
+  resetScreenEngineCache, screenEngineWarning, sourceArgs, captureArgs,
+} from '../src/capture.js';
 
 const W = 160;
 const H = 90;
@@ -174,4 +180,195 @@ test('采集参数：设备源走 dshow，保留 -r 和 rtbufsize', async () => 
   assert.ok(cam.includes('-r 12'), '设备帧率不是 12，要重采样');
   assert.ok(cam.includes('-rtbufsize'), '直播设备必须给缓冲');
   assert.ok(!cam.includes('-framerate'), 'dshow 不能加 -framerate，会 I/O error');
+});
+
+function fakeChild() {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.kill = () => {
+    child.kills = (child.kills ?? 0) + 1;
+    queueMicrotask(() => child.emit('close', null, 'SIGKILL'));
+    return true;
+  };
+  return child;
+}
+
+test('checkRegion：校验物理像素整数坐标，非负规则分引擎处理', () => {
+  assert.doesNotThrow(() => checkRegion({ x: 0, y: 0, w: 1920, h: 1080 }));
+  assert.doesNotThrow(() => checkRegion(null));
+  assert.doesNotThrow(() => checkRegion(undefined));
+
+  assert.throws(() => checkRegion({ x: 10.5, y: 0, w: 100, h: 100 }), /RangeError.*region 必须使用物理像素整数坐标/);
+  assert.throws(() => checkRegion({ x: 0, y: 0, w: 0, h: 100 }), /RangeError/);
+  assert.throws(() => checkRegion({ x: 0, y: 0, w: 100, h: -50 }), /RangeError/);
+
+  assert.throws(() => checkRegion({ x: -10, y: 0, w: 100, h: 100 }), /RangeError/);
+  assert.throws(() => checkRegion({ x: 0, y: -20, w: 100, h: 100 }), /RangeError/);
+
+  assert.doesNotThrow(() => checkRegion({ x: -1920, y: 0, w: 1920, h: 1080 }, { allowNegative: true }));
+  assert.doesNotThrow(() => checkRegion({ x: 0, y: -1080, w: 1920, h: 1080 }, { allowNegative: true }));
+
+  assert.throws(() => sourceArgs({ kind: 'screen', region: { x: -5, y: 0, w: 100, h: 100 } }, { platform: 'darwin' }), /RangeError/);
+  assert.throws(() => sourceArgs({ kind: 'screen', region: { x: 0, y: 0, w: 0, h: 100 } }, { platform: 'win32', engine: 'ddagrab' }), /RangeError/);
+});
+
+test('listDevices：解析 macOS avfoundation 与 Windows dshow 输出，带超时和异常防护', async () => {
+  const macChild = fakeChild();
+  const macPromise = listDevices({
+    platform: 'darwin',
+    ffmpegPath: 'ffmpeg',
+    spawnProcess: () => macChild,
+  });
+  macChild.stderr.write(
+    '[AVFoundation indev @ 0x123] AVFoundation video devices:\n' +
+    '[AVFoundation indev @ 0x123] [0] FaceTime HD Camera\n' +
+    '[AVFoundation indev @ 0x123] [1] Capture screen 0\n' +
+    '[AVFoundation indev @ 0x123] AVFoundation audio devices:\n' +
+    '[AVFoundation indev @ 0x123] [0] Built-in Microphone\n'
+  );
+  macChild.emit('close', 1);
+  const macRes = await macPromise;
+  assert.equal(macRes.platform, 'darwin');
+  assert.deepEqual(macRes.devices, [
+    { index: 0, name: 'FaceTime HD Camera', kind: 'camera' },
+    { index: 1, name: 'Capture screen 0', kind: 'screen' },
+    { index: 0, name: 'Built-in Microphone', kind: 'audio' },
+  ]);
+
+  const winChild = fakeChild();
+  const winPromise = listDevices({
+    platform: 'win32',
+    ffmpegPath: 'ffmpeg.exe',
+    spawnProcess: () => winChild,
+  });
+  winChild.stderr.write(
+    '[dshow @ 0x123] DirectShow video devices\n' +
+    '[dshow @ 0x123]  "Integrated Webcam" (video)\n' +
+    '[dshow @ 0x123] DirectShow audio devices\n' +
+    '[dshow @ 0x123]  "Microphone Array" (audio)\n'
+  );
+  winChild.emit('close', 1);
+  const winRes = await winPromise;
+  assert.equal(winRes.platform, 'win32');
+  assert.deepEqual(winRes.devices, [
+    { index: 0, name: 'Integrated Webcam', kind: 'camera' },
+    { index: 0, name: 'Microphone Array', kind: 'audio' },
+  ]);
+
+  await assert.rejects(listDevices({ platform: 'linux' }), /RangeError.*linux 暂无设备枚举实现/);
+
+  const emptyChild = fakeChild();
+  const emptyPromise = listDevices({
+    platform: 'darwin',
+    spawnProcess: () => emptyChild,
+  });
+  emptyChild.emit('close', 1);
+  await assert.rejects(emptyPromise, /FFmpeg 未返回设备/);
+
+  const timeoutChild = fakeChild();
+  const timeoutPromise = listDevices({
+    platform: 'darwin',
+    timeoutMs: 10,
+    spawnProcess: () => timeoutChild,
+  });
+  await assert.rejects(timeoutPromise, /设备枚举超过 10ms/);
+  assert.ok(timeoutChild.kills >= 1, '超时必须 kill 子进程');
+});
+
+test('captureErrorInfo：依据明确证据将异常分类，保留底层 stage、code 与 stderrTail', () => {
+  const enoent = Object.assign(new Error('spawn ffmpeg ENOENT'), { code: 'ENOENT' });
+  const c1 = captureErrorInfo(enoent, 'spawn');
+  assert.equal(c1.category, 'dependency-missing');
+  assert.equal(c1.stage, 'spawn');
+  assert.equal(c1.code, 'ENOENT');
+
+  const range = new RangeError('region 必须使用物理像素整数坐标');
+  const c2 = captureErrorInfo(range, 'validate');
+  assert.equal(c2.category, 'invalid-input');
+
+  const perm = Object.assign(new Error('AVFoundation: permission denied'), { stderrTail: 'permission denied' });
+  const c3 = captureErrorInfo(perm, 'exit');
+  assert.equal(c3.category, 'permission-denied');
+  assert.equal(c3.stderrTail, 'permission denied');
+
+  const devErr = new Error('video device not available: Could not find video device');
+  const c4 = captureErrorInfo(devErr);
+  assert.equal(c4.category, 'device-unavailable');
+
+  const generic = new Error('ffmpeg exit 1: unknown error');
+  const c5 = captureErrorInfo(generic);
+  assert.equal(c5.category, 'capture-failed');
+
+  assert.equal(captureErrorInfo({ errorInfo: c1 }), c1);
+});
+
+test('pickScreenEngine：探针总超时控制、子进程关闭等待、缓存与黑屏预警', async () => {
+  resetScreenEngineCache();
+
+  const triedFormats = [];
+  const macSpawn = (cmd, args) => {
+    const child = fakeChild();
+    const pfIdx = args.indexOf('-pixel_format');
+    const pf = pfIdx !== -1 ? args[pfIdx + 1] : null;
+    triedFormats.push(pf);
+    queueMicrotask(() => {
+      if (pf === 'nv12') {
+        child.emit('close', 1);
+      } else {
+        child.stdout.write(Buffer.alloc(64 * 36 * 3, 128));
+      }
+    });
+    return child;
+  };
+
+  const eng1 = await pickScreenEngine({
+    platform: 'darwin',
+    ffmpegPath: 'ffmpeg',
+    spawnProcess: macSpawn,
+  });
+  assert.equal(eng1, 'avfoundation');
+  assert.deepEqual(triedFormats, ['nv12', 'uyvy422']);
+  assert.equal(screenEngineWarning(), null, '有效像素不应报警');
+
+  const beforeCount = triedFormats.length;
+  const engCached = await pickScreenEngine({
+    platform: 'darwin',
+    ffmpegPath: 'ffmpeg',
+    spawnProcess: () => { throw new Error('不应再次调用 spawn'); },
+  });
+  assert.equal(engCached, 'avfoundation');
+  assert.equal(triedFormats.length, beforeCount);
+
+  resetScreenEngineCache();
+  const blackSpawn = () => {
+    const child = fakeChild();
+    queueMicrotask(() => {
+      child.stdout.write(Buffer.alloc(64 * 36 * 3, 0));
+    });
+    return child;
+  };
+  await pickScreenEngine({
+    platform: 'darwin',
+    ffmpegPath: 'ffmpeg',
+    spawnProcess: blackSpawn,
+  });
+  assert.match(screenEngineWarning(), /没有「屏幕录制」权限/);
+
+  resetScreenEngineCache();
+  const winSpawn = () => {
+    const child = fakeChild();
+    queueMicrotask(() => {
+      child.stdout.write(Buffer.alloc(64 * 36 * 3, 200));
+    });
+    return child;
+  };
+  const winEng = await pickScreenEngine({
+    platform: 'win32',
+    ffmpegPath: 'ffmpeg.exe',
+    spawnProcess: winSpawn,
+  });
+  assert.equal(winEng, 'ddagrab');
+
+  resetScreenEngineCache();
 });
