@@ -307,6 +307,32 @@ test('CLI 独立窗口传 standalone 标志，仍等 ready 再返回', async (t)
   await closeWindow();
 });
 
+test('旧窗口已替换时，旧 child 的延迟命令被忽略', async (t) => {
+  const script = join(home, 'stale.py');
+  writeFileSync(script, 'DSH_SEE_WINDOW_PROTOCOL = 1\nDSH_SEE_WINDOW_COMMANDS = 1\n');
+  const children = [];
+  t.mock.method(childProcess, 'execFile', (_exe, _args, _options, callback) => callback(null));
+  t.mock.method(childProcess, 'spawn', () => {
+    const child = new EventEmitter();
+    child.pid = 2147483700 + children.length;
+    child.stdout = new PassThrough();
+    child.stdin = new PassThrough();
+    child.unref = () => {};
+    child.kill = () => queueMicrotask(() => child.emit('exit', 0, null));
+    children.push(child);
+    queueMicrotask(() => child.stdout.write('DSH_SEE_WINDOW {"version":1,"state":"ready"}\n'));
+    return child;
+  });
+  const received = [];
+  await openWindow({ script, onCommand: (cmd) => received.push(cmd) });
+  const firstChild = children[0];
+  await openWindow({ script, force: true, onCommand: (cmd) => received.push(cmd) });
+  firstChild.stdout.write('DSH_SEE_WINDOW {"version":1,"command":"pause"}\n');
+  await new Promise((r) => setImmediate(r));
+  assert.equal(received.length, 0, '旧 child 的命令必须被丢弃');
+  await closeWindow();
+});
+
 test('心跳过期时 windowAlive 判死 —— 进程还在也不行', async () => {
   const { chatDir } = await import('../src/chat.js');
   const { mkdirSync, utimesSync } = await import('node:fs');

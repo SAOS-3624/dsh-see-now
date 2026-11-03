@@ -55,15 +55,21 @@ test('包内那份是合法的 Python（语法能过）', (t) => {
   assert.match(probe.stdout, /ok/);
 });
 
-test('macOS 独立入口只用标准库，不导入 Windows 窗口', () => {
+test('macOS 独立入口只用标准库，不导入 Windows 窗口', (t) => {
   const entry = join(ROOT, 'examples', 'floating-chat', 'macos-window.py');
   const ui = join(ROOT, 'examples', 'floating-chat', 'macos.py');
   const text = readFileSync(entry, 'utf8');
   assert.match(text, /DSH_SEE_WINDOW_PROTOCOL = 1/);
   assert.match(text, /DSH_SEE_WINDOW_COMMANDS = 1/);
   assert.doesNotMatch(text, /from window|import window|PIL|ctypes|mss/);
+  let py = null;
+  for (const candidate of ['python3', 'python']) {
+    const probe = spawnSync(candidate, ['-c', 'print(1)'], { encoding: 'utf8', windowsHide: true, timeout: 5000 });
+    if (!probe.error && probe.status === 0) { py = candidate; break; }
+  }
+  if (!py) return t.skip('未找到可运行的 Python');
   for (const path of [entry, ui]) {
-    const result = spawnSync('python3', ['-c',
+    const result = spawnSync(py, ['-c',
       'import ast,sys;ast.parse(open(sys.argv[1],encoding="utf-8").read())', path],
       { encoding: 'utf8', timeout: 15000 });
     assert.equal(result.status, 0, result.stderr);

@@ -415,9 +415,14 @@ async function launchWindow({
           const command = commands && windowCommand(event);
           if (command && record.onCommand && !record.stopReason && !record.exited && owned === record && record.status.state === 'ready') {
             const { version: _version, ...action } = command;
-            Promise.resolve().then(() => record.onCommand(action)).catch((error) => {
+            Promise.resolve().then(() => {
+              if (owned !== record || record.exited || record.stopReason) return;
+              return record.onCommand(action);
+            }).catch((error) => {
               log(`[window] command: ${error?.message ?? error}`);
-              sendWindowState({ ...pendingWindowState, lastError: String(error?.message ?? error).slice(0, 400) });
+              if (owned === record) {
+                sendWindowState({ ...pendingWindowState, lastError: String(error?.message ?? error).slice(0, 400) });
+              }
             });
           }
         } catch { /* 外部脚本的普通输出 */ }
