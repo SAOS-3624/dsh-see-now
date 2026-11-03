@@ -64,8 +64,9 @@ export function seeNowToolSpec() {
     parameters: {
       action: {
         type: 'string',
-        description: 'watch (default) | peek | start | stop | status',
+        description: 'watch（默认）| peek | start | stop | status | pause | resume | seek（文件跳转）| configure（更新设置，不取图）',
       },
+      position: { type: 'number', description: 'action:"seek" 时定位到本地视频的非负秒数，返回预览；保留原先的暂停/播放状态。' },
       source: {
         type: 'string',
         description: 'Where to capture from: "screen" (whole desktop, default), "obs" (OBS virtual camera), '

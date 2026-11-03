@@ -116,16 +116,23 @@ function sheetText(sheet, { waited = 0, partial = false, userText = null, say = 
  * **`saveImage` 必须 `.call(svc, …)`**：它内部读 `this.compression`，方法取下来裸调会丢 this，
  * 报 `Cannot read properties of undefined (reading 'compression')` —— 所有出图工具一起挂。
  */
-async function attachAndReturn(ctx, sheet, extra = {}) {
+async function attachAndReturn(ctx, sheet, extra = {}, signal = null, acknowledge = null) {
   const svc = serviceOf(ctx, 'attachments');
   if (!svc?.saveImage) {
     return { text: '拿到图了，但宿主没有 attachments 服务，交不上去。', meta: { ok: false, ...extra } };
   }
-  const ref = await svc.saveImage.call(svc, {
+  let ref;
+  try {
+    ref = await svc.saveImage.call(svc, {
     data: sheet.png,
     mediaType: 'image/png',
     name: `see-now-${Date.now()}.png`,
   });
+  } catch (e) {
+    return { text: `画面附件保存失败，当前文件图保留待重试：${e?.message ?? e}`, meta: { ok: false, reason: 'attachment-failed' } };
+  }
+  if (signal?.aborted && signal.reason !== 'control') return { text: '这一轮已取消，文件图保留待重试。', meta: { ok: false, reason: 'cancelled' } };
+  acknowledge?.();
   // `say` 是给清单用的，不进 meta —— 那是整段话，塞进 meta 只会让返回值翻倍
   const { say: said, ...meta } = extra;
   return {
@@ -400,6 +407,18 @@ async function registerAll(ctx) {
         }[wantPace];
         pendingModeNote = [t, pendingModeNote].filter(Boolean).join('\n\n');
         log(t.replace(/\*\*/g, ''));
+      }
+
+      if (action === 'pause' || action === 'resume' || action === 'seek' || action === 'configure') {
+        const result = action === 'seek' ? await runner.seek(args.position)
+          : action === 'configure' ? await runner.configure({ quality: args.quality })
+          : await runner[action]();
+        if (result.sheet) {
+          const saved = await attachAndReturn(ctx, result.sheet, {}, run?.externalSignal ?? run?.signal, () => runner.acknowledge(result.sheet));
+          if (saved.meta?.ok === false) return saved;
+          return { ...saved, text: `已跳转到 ${result.playback.requestedPositionSec ?? result.playback.positionSec}s，预览已附上。`, meta: { ...saved.meta, ...result } };
+        }
+        return { text: result.ok ? `文件操作完成：${action}` : `文件操作未完成：${result.reason}`, meta: result };
       }
 
       if (action === 'watch') {

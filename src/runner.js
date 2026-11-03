@@ -116,7 +116,7 @@ export function guardReason({ hungUp = false, fileEnded = false, explicitSrc = f
   return null;
 }
 
-export function createRunner({ ffmpegPath = 'ffmpeg', log = () => {}, graceSec = 60 } = {}) {
+export function createRunner({ ffmpegPath = 'ffmpeg', log = () => {}, graceSec = 60, spawnCapture = spawnFrames, openCaptureWindow = openWindow } = {}) {
   let pipeline = null;   // 当前（或刚停的）引擎 —— 停采集后仍留着，好把队列里剩的图发完
   let running = false;
   let run = null;
@@ -214,8 +214,69 @@ export function createRunner({ ffmpegPath = 'ffmpeg', log = () => {}, graceSec =
     return true;
   }
 
-  async function start({ src = { kind: 'screen' }, opts = {}, quality: q = null } = {}) {
-    if (running) return { already: true, source };
+  let userPaused = false, deliveredAt = null, positionSec = 0, requestedPositionSec = null, durationSec = null, delivery = null, controlBusy = false;
+  function playback() {
+    const file = lastSource?.kind === 'file';
+    return { state: !file ? 'unavailable' : userPaused ? 'paused' : endedSource && !delivery && !pipeline?.pending ? 'ended' : running ? 'playing' : 'stopped',
+      positionSec: file ? positionSec : 0, requestedPositionSec: file ? requestedPositionSec : null,
+      durationSec: file ? durationSec : null, canSeek: Boolean(file) };
+  }
+  function takeSheet() {
+    if (delivery) return delivery.sheet;
+    const sheet = pipeline?.take();
+    if (sheet && lastSource?.kind === 'file') delivery = { sheet, pipeline };
+    return sheet ?? null;
+  }
+  function acknowledge(sheet) {
+    if (!delivery || delivery.sheet !== sheet) return false;
+    if (delivery.pipeline === pipeline) {
+      deliveredAt = Math.max(deliveredAt ?? 0, sheet.to);
+      positionSec = deliveredAt;
+      requestedPositionSec = null;
+      delivery = null;
+      if (!userPaused && !pipeline?.pending) run?.resume();
+    } else delivery = null;
+    return true;
+  }
+  async function changePlayback(position, { nextQuality = quality, nextOpts = runOpts, preview = true } = {}) {
+    if (lastSource?.kind !== 'file') return { ok: false, reason: 'unavailable', playback: playback() };
+    if (!Number.isFinite(position) || position < 0) return { ok: false, reason: 'invalid-position', playback: playback() };
+    if (controlBusy) return { ok: false, reason: 'busy', playback: playback() };
+    controlBusy = true;
+    const paused = userPaused;
+    const src = lastSource;
+    try {
+      const frameSec = 1 / (pipeline?.constants.fps ?? 12);
+      const at = durationSec == null ? position : Math.min(position, Math.max(0, durationSec - frameSec));
+      requestedPositionSec = at;
+      await teardown('reconfigure');
+      pipeline = null;
+      delivery = null;
+      await start({ src: { ...src, startSec: at }, opts: nextOpts, quality: nextQuality, preservePosition: true, paused, preview });
+      if (preview) {
+        const until = Date.now() + 15_000;
+        while (!pipeline?.pending && running && Date.now() < until) await sleep(20);
+      }
+      if (paused) await teardown('paused');
+      return { ok: true, playback: playback(), sheet: pipeline?.peek() ?? null };
+    } finally { controlBusy = false; }
+  }
+  async function pause() {
+    if (lastSource?.kind !== 'file') return { ok: false, reason: 'unavailable', playback: playback() };
+    if (userPaused) return { ok: true, playback: playback() };
+    userPaused = true;
+    await teardown('paused');
+    return { ok: true, playback: playback() };
+  }
+  async function resume() {
+    if (lastSource?.kind !== 'file') return { ok: false, reason: 'unavailable', playback: playback() };
+    if (!userPaused) return { ok: !endedSource, reason: endedSource ? 'file-ended' : undefined, playback: playback() };
+    const at = requestedPositionSec ?? (deliveredAt === null ? 0 : deliveredAt + 1 / (pipeline?.constants.fps ?? 12));
+    userPaused = false;
+    return changePlayback(at, { preview: false });
+  }
+  async function start({ src = { kind: 'screen' }, opts = {}, quality: q = null, preservePosition = false, paused = false, preview = false } = {}) {
+    if (running && !preservePosition && src.kind !== 'file') return { already: true, source };
     // 走到这里就是"明确要开始看"（watch 的自动重启已经在前面被硬闸挡住了）。
     hungUp = false;
     endedSource = null;
@@ -227,7 +288,7 @@ export function createRunner({ ffmpegPath = 'ffmpeg', log = () => {}, graceSec =
     if (src.kind === 'screen' && engine === 'auto') engine = await pickScreenEngine({ ffmpegPath });
     const size = SIZES[q] ?? SIZES[DEFAULT_QUALITY];
     // oneShot 由调用方（watch）决定：**只有换清晰度**时置 true（缓冲区刚扔，等攒满等于白等一个窗口）
-    const p = createPipeline({ ...opts, width: size[0], height: size[1] });
+    const p = createPipeline({ ...opts, ...(src.kind === 'file' ? { queueDepth: 0 } : {}), width: size[0], height: size[1] });
     // 记下"这次建管线用的调用方参数"（不含 oneShot）——watch 靠它发现"模式变了"。
     runOpts = { ...opts };
     delete runOpts.oneShot;
@@ -240,25 +301,33 @@ export function createRunner({ ffmpegPath = 'ffmpeg', log = () => {}, graceSec =
     source = s;
     lastSource = s;
     startedAt = Date.now();
-    run = spawnFrames({
+    userPaused = s.kind === 'file' && paused;
+    run = spawnCapture({
       source: s,
       width: p.constants.width,
       height: p.constants.height,
       fps: p.constants.fps,
       ffmpegPath,
       engine,
+      baseSec: s.kind === 'file' ? Number(s.startSec ?? 0) : 0,
       onFrame: (f) => {
         frames += 1;
-        // 一帧解码就抛 = 整条管线停摆，这里必须兜住：宁可少一帧，不能让采集线程炸掉
         try { p.push(f); } catch (e) { lastError = `push: ${e?.message ?? e}`; }
+        if (s.kind === 'file' && preview) { p.flushNow(null, 'seek', { preserveQueue: true }); preview = false; }
+        return s.kind !== 'file' || (!userPaused && !delivery && p.pending === 0);
       },
       onStderr: (s2) => { if (process.env.DSH_SEE_NOW_DEBUG) log(s2.trim()); },
     });
+    if (userPaused && !preview) run.pause();
     run.done.then((r) => {
       if (pipeline === p) {
+        if (r.reason === 'eof') {
+          p.finish({ includeLast: true });
+          endedSource = s;
+          teardown('eof');
+          return;
+        }
         lastError ??= `ffmpeg 退出（${r.frames} 帧 / ${Math.round(r.ms / 1000)}s）`;
-        // 文件源放完 = 这一次看完了。记下来，别让下一条 watch 又从头放一遍。
-        if (s.kind === 'file') endedSource = s;
         teardown('ffmpeg-exit');
       }
     }).catch((e) => {
@@ -270,7 +339,7 @@ export function createRunner({ ffmpegPath = 'ffmpeg', log = () => {}, graceSec =
     // 探针已经试出来了，这里把它带回去，让模型（和用户）知道该去系统设置，而不是以为插件坏了。
     const warning = s.kind === 'screen' ? screenEngineWarning() : null;
     if (warning) log(`⚠️ ${warning}`);
-    return { started: true, source: s, engine, quality, params: p.constants, warning };
+    return { started: true, source: s, engine, quality, params: p.constants, warning, playback: playback() };
   }
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -285,7 +354,7 @@ export function createRunner({ ffmpegPath = 'ffmpeg', log = () => {}, graceSec =
   async function ensureWindow() {
     if (windowState?.ok) return windowState;
     if (windowPending) return windowPending;
-    windowPending = openWindow({ log }).then((st) => {
+    windowPending = openCaptureWindow({ log }).then((st) => {
       windowState = st;
       if (st.ok) {
         windowOpened = true;
@@ -460,7 +529,7 @@ export function createRunner({ ffmpegPath = 'ffmpeg', log = () => {}, graceSec =
             // **插话优先于一切**：用户说话了就立刻截断，不等判据、不排队
             const said = pollUser();
             if (said) return await interjectNow(said);
-            const s = pipeline?.take();
+            const s = takeSheet();
             if (s) {
               // **正常返回也要过 minFrames**。以前只有超时分支检查，于是
               // `minFrames: 5` 在队列先到的路径上会被无视，照样交一张 1 帧的图
@@ -508,12 +577,14 @@ export function createRunner({ ffmpegPath = 'ffmpeg', log = () => {}, graceSec =
      * 顺便支窗（**不等它**）：走 peek 路线的会话没有 watch 的阻塞点，
      * 不在这里开窗的话，用户永远没有可以打字的入口，也就没有"关窗 = 不看了"。
      */
-    peek() {
-      const queued = pipeline?.take() ?? null;
+    peek({ allowPaused = false } = {}) {
+      if (userPaused && !allowPaused) return null;
+      const queued = takeSheet() ?? null;
       if (running) armGrace();
       if (!windowState?.ok && !windowPending) void ensureWindow();
       return queued;
     },
+    acknowledge,
 
     /** 常驻循环每拍续命（见 touch 的注释） */
     touch,
@@ -556,7 +627,13 @@ export function createRunner({ ffmpegPath = 'ffmpeg', log = () => {}, graceSec =
         windowOpened,
         // 有没有待领的说明（挂断那条）—— status 里看得见，才不会"明明写了没人读"
         notePending: Boolean(pendingNote),
+        playback: playback(),
       };
+    },
+    pause, resume, seek(position) { return changePlayback(position); },
+    configure({ quality: q = null, opts = {} } = {}) {
+      const at = requestedPositionSec ?? (deliveredAt === null ? 0 : deliveredAt + 1 / (pipeline?.constants.fps ?? 12));
+      return changePlayback(at, { nextQuality: q ?? quality, nextOpts: opts, preview: true });
     },
   };
 }

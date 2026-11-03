@@ -96,6 +96,13 @@ function withMark(text) {
   return lines.join('\n');
 }
 
+// macOS 独立入口由本包维护，不从 Windows 上游脚本生成。
+for (const name of ['macos.py', 'macos-window.py']) {
+  if (!existsSync(join(ROOT, 'examples', 'floating-chat', name))) {
+    throw new Error(`[sync-window] 缺少 macOS 窗口：${name}`);
+  }
+}
+
 const upstream = findUpstream();
 
 if (!upstream) {

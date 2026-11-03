@@ -28,20 +28,24 @@ if (args.has('--status') || args.has('-s')) {
 }
 
 if (args.has('--close') || args.has('-c')) {
-  closeWindow();
+  const closed = await closeWindow({ verifiedExternal: true });
+  if (!closed?.ok) { fail(`窗口未关闭：${closed?.reason ?? '未知原因'}`); process.exit(1); }
   say('已关掉悬浮窗');
   process.exit(0);
 }
 
 const force = args.has('--force') || args.has('-f');
-const r = await openWindow({ force });
+if (force) {
+  const closed = await closeWindow({ verifiedExternal: true });
+  if (!closed?.ok && !closed?.already) { fail(`窗口未重开：${closed?.reason ?? '未知原因'}`); process.exit(1); }
+}
+const r = await openWindow({ force, standalone: true });
 
 if (r.ok) {
   say(r.already ? '悬浮窗已经开着了' : `悬浮窗已打开（${r.python ?? '未知解释器'}）`);
   process.exit(0);
 }
 
-// 失败要说清楚"下一步干什么"，不然用户看到的只是"点了没反应"
 fail(`开不起来：${r.reason ?? '未知原因'}`);
 if (r.reason === 'disabled') {
   fail('环境变量 DSH_SEE_NO_WINDOW=1 把窗口显式关掉了 —— 去掉它再试。');

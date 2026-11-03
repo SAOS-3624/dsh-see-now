@@ -35,6 +35,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { performance } from 'node:perf_hooks';
 
 /** 屏幕采集引擎。macOS 只有 avfoundation；Windows 走 ddagrab/gdigrab。 */
 export const ENGINES = Object.freeze(['auto', 'ddagrab', 'gdigrab', 'avfoundation']);
@@ -165,55 +166,112 @@ export function captureArgs({
 }
 
 /**
- * 逐帧读，**同步回调**。回调里做的事会直接变成对 ffmpeg 的背压 —— 这是刻意的：
- * 判帧、留帧、重排都在回调里跑完，绝不让帧在内存里越堆越多。
- *
- * @returns {{stop:()=>void, done:Promise<{frames:number, ms:number, code:number|null}>}}
- */export function spawnFrames({
+ * 同步逐帧回调；返回 false 同时暂停内部 drain 和 stdout，resume 后先消费保留的字节。
+ * 文件时间使用 baseSec + i/fps；实时源使用首帧起算的单调时钟。
+ * stop 幂等并返回 done；done 只在进程关闭且保留帧消费完后完成。
+ */
+export function spawnFrames({
   source, width, height, fps, ffmpegPath = 'ffmpeg', engine = 'auto',
-  onFrame, onStderr = null, onFirst = null,
+  onFrame, onStderr = null, onFirst = null, baseSec = source?.seek ?? source?.startSec ?? 0,
+  firstFrameTimeoutMs = 15_000, spawnProcess = spawn,
 } = {}) {
+  if (![width, height].every((n) => Number.isInteger(n) && n > 0) || !Number.isFinite(fps) || fps <= 0 || !Number.isFinite(baseSec) || baseSec < 0) {
+    throw new RangeError('采集宽高必须是正整数，fps 为正数，baseSec 为非负秒数');
+  }
   const args = captureArgs({ source, width, height, fps, ffmpegPath, engine }).slice(1);
-  const child = spawn(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawnProcess(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
   const need = width * height * 3;
   let pending = null;
   let n = 0;
-  const t0 = Date.now();
+  const t0 = performance.now();
+  let firstAt = null;
   let err = '';
+  let paused = false;
+  let stopped = false;
+  let settled = false;
+  let closed = null;
+  let failure = null;
+  let timer = null;
+  let resolveDone;
+  let rejectDone;
+  const done = new Promise((resolveDone2, rejectDone2) => { resolveDone = resolveDone2; rejectDone = rejectDone2; });
 
-  const done = new Promise((resolve, reject) => {
-    child.stdout.on('data', (chunk) => {
-      pending = pending?.length ? Buffer.concat([pending, chunk]) : chunk;
-      while (pending.length >= need) {
+  function settle() {
+    if (settled || !closed || (!stopped && !failure && pending?.length)) return;
+    settled = true;
+    clearTimeout(timer);
+    if (failure) rejectDone(failure);
+    else resolveDone({ reason: stopped ? 'stopped' : 'eof', frames: n, ms: performance.now() - t0, ...closed });
+  }
+  function fail(error) {
+    if (failure || settled || stopped) return;
+    clearTimeout(timer);
+    failure = error;
+    pending = null;
+    child.stdout.resume();
+    if (!closed) { try { child.kill('SIGKILL'); } catch { /* 等待已退出进程的 close */ } }
+    settle();
+  }
+  function drain() {
+    try {
+      while (!paused && !stopped && !failure && pending?.length >= need) {
         const buf = pending.subarray(0, need);
         pending = pending.subarray(need);
-        const i = n;
-        n += 1;
-        if (i === 0) onFirst?.(Date.now() - t0);
-        onFrame?.({ i, t: i / fps, buf });
+        const i = n++;
+        if (i === 0) {
+          clearTimeout(timer);
+          firstAt = performance.now();
+          onFirst?.(firstAt - t0);
+        }
+        const t = source?.kind === 'file' ? baseSec + i / fps : (performance.now() - firstAt) / 1000;
+        if (onFrame?.({ i, t, buf }) === false) { paused = true; child.stdout.pause(); }
       }
-      if (pending.length === 0) pending = null;
-    });
-    child.stderr.on('data', (d) => {
-      err = `${err}${d}`.slice(-4000);
-      onStderr?.(String(d));
-    });
-    child.on('error', reject);
-    child.on('close', (code) => {
-      // `code === null` = 被我们自己 SIGKILL 的（stop / 换清晰度 / 收工）。
-      // 那是正常收尾，不是失败 —— 否则每次 stop 都往 lastError 里写一条假错误。
-      if (code !== 0 && code !== null && err.trim()) {
-        reject(new Error(`ffmpeg exit ${code}: ${err.trim().slice(-300)}`));
-        return;
+      if (pending?.length === 0) pending = null;
+      if (closed && pending?.length && pending.length < need && !paused && !stopped) {
+        fail(new Error(`FFmpeg 原始帧不完整：${pending.length}/${need} 字节`));
       }
-      resolve({ frames: n, ms: Date.now() - t0, code });
-    });
+    } catch (error) { fail(error); }
+    settle();
+  }
+  child.stdout.on('data', (chunk) => {
+    if (stopped || failure) return;
+    pending = pending?.length ? Buffer.concat([pending, chunk]) : chunk;
+    drain();
   });
+  child.stderr.on('data', (d) => {
+    err = `${err}${d}`.slice(-4000);
+    try { onStderr?.(String(d)); } catch (error) { fail(error); }
+  });
+  child.on('error', (error) => fail(new Error(`FFmpeg 启动失败（${ffmpegPath}，${error.code ?? 'error'}）：${error.message}`, { cause: error })));
+  child.on('close', (code, signal) => {
+    closed = { code, signal: signal ?? null };
+    clearTimeout(timer);
+    if (!stopped && code !== 0) fail(new Error(`FFmpeg 退出（${ffmpegPath}，code=${code}，signal=${signal ?? 'none'}）：${err.trim().slice(-1000) || '无 stderr'}`));
+    drain();
+  });
+  if (firstFrameTimeoutMs > 0) timer = setTimeout(() => {
+    fail(new Error(`FFmpeg ${firstFrameTimeoutMs}ms 内未产生首帧（${ffmpegPath}）：${err.trim().slice(-1000) || '无 stderr'}`));
+  }, firstFrameTimeoutMs);
 
   return {
     done,
+    pause() { if (!settled) { paused = true; child.stdout.pause(); } },
+    resume() {
+      if (settled || stopped || failure) return;
+      paused = false;
+      drain();
+      if (!paused && !closed && !failure) child.stdout.resume();
+    },
     stop() {
-      try { child.kill('SIGKILL'); } catch { /* 已经没了 */ }
+      if (!stopped && !settled) {
+        stopped = true;
+        pending = null;
+        clearTimeout(timer);
+        child.stdout.resume();
+        if (!closed) { try { child.kill('SIGKILL'); } catch { /* 等待 close */ } }
+        settle();
+      }
+      return done;
     },
   };
 }

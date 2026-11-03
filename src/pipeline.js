@@ -437,11 +437,13 @@ export function createPipeline(opts = {}) {
     },
 
     /** 流结束：把还剩的那一帧判掉，再把最后一张发出去。 */
-    finish() {
+    finish({ includeLast = false } = {}) {
       while (q.length) {
         decide(q[0], q.length > 1 ? q[1].score : null);
         q.shift();
       }
+      const keptAt = frames.length ? frames[frames.length - 1].t : lastBound;
+      if (includeLast && lastSeen && lastSeen.t > keptAt + 1e-6) keep(lastSeen, 'floor');
       // 收尾这批也要**一段一箱**：多箱多半出现在最后（帧都攒在尾部），
       // 直接发就会把两箱画到一张画布上。
       let guard = 0;
@@ -466,7 +468,8 @@ export function createPipeline(opts = {}) {
      *
      * @returns {object|null} 这一张（同时清空队列，插话永远拿最新的）
      */
-    flushNow(t = null, why = 'user') {
+    flushNow(t = null, why = 'user', { preserveQueue = false } = {}) {
+      if (preserveQueue && sheets.length) return sheets[0];
       // **永远把「此刻那一帧」补进去**，不只是本张为空时。
       // 用户问的是"现在屏幕上是什么"，只给他攒了半张的旧帧不对（实测插话在 30s，
       // 图里最后一帧是 26.5s，差了三秒多）。
@@ -487,7 +490,7 @@ export function createPipeline(opts = {}) {
       if (!frames.length) return null;
       const at = t ?? frames[frames.length - 1].t;
       const made = flush(at, why);
-      sheets.length = 0;
+      if (!preserveQueue) sheets.length = 0;
       return made ?? null;
     },
 

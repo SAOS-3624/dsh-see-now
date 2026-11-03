@@ -22,9 +22,9 @@
  * - **pid 锁**：`~/.dsh/see-now-window.pid`。不分开的话，陪看的窗开着时我们就不敢开了。
  */
 
-import { spawn, spawnSync } from 'node:child_process';
-import { closeSync, existsSync, openSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import childProcess, { spawn, spawnSync } from 'node:child_process';
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { chatDir, dshHome } from './chat.js';
@@ -32,6 +32,8 @@ import { chatDir, dshHome } from './chat.js';
 const HERE = dirname(fileURLToPath(import.meta.url));
 /** 包里自带的那份 —— 由 `scripts/sync-window.mjs` 从上游生成，是最后的兜底 */
 export const PACKAGED = join(HERE, '..', 'examples', 'floating-chat', 'window.py');
+/** macOS 独立入口，不导入 Windows 窗口。 */
+export const MACOS = join(HERE, '..', 'examples', 'floating-chat', 'macos-window.py');
 const REL = join('examples', 'floating-chat', 'window.py');
 
 function readJson(p) {
@@ -60,11 +62,6 @@ function logPath() {
 
 /**
  * 已安装的 `dsh-watch-together` 里那份 window.py（可能有多份）。
- *
- * 坑：以前硬编码 `profiles/desktop`，但 profile 名不止一个（本机有 `desktop` 和 `web`），
- * 而且 npm 还可能把它 hoist 到 `profiles/node_modules`。所以这里**全扫**。
- * 用运行中的那份而不是仓库那份，是因为 DSH 实际加载的就是 profile 里的副本 ——
- * 测仓库版等于没测到真正分发的版本。
  */
 function installedCopies(env = process.env) {
   const home = dshHome(env);
@@ -84,26 +81,15 @@ function installedCopies(env = process.env) {
 
 /**
  * 窗口脚本放哪（按优先级找第一份存在的）。
- *
- * | 顺序 | 来源 | 什么时候用 |
- * |---|---|---|
- * | 1 | `DSH_SEE_WINDOW` | 临时指定、调试 |
- * | 2 | `~/.dsh/see-window.json` 的 `script` | 持久配置 |
- * | 3 | `~/.dsh/watch-window.json` 的 `script` | 用户在陪看那边维护的那份 |
- * | 4 | 已安装的 watch-together | **用户装了就永远是最新的**，零重复 |
- * | 5 | 开发仓库 `../dsh-watch-together` | 一边改一边试 |
- * | 6 | 包内 `examples/floating-chat/window.py` | 用户没装 watch 时的兜底 |
- *
- * 导出是为了让 `--check` 能报清楚究竟用的是哪个。
- *
- * @param {{env?:object}} [o] — 传 env 是为了让测试不用改 process.env
  */
-export function resolveScript({ env = process.env } = {}) {
+export function resolveScript({ env = process.env, platform = process.platform } = {}) {
   const explicit = env.DSH_SEE_WINDOW;
   if (explicit && existsSync(explicit)) return { script: explicit, from: 'DSH_SEE_WINDOW' };
 
   const seen = readJson(join(dshHome(env), 'see-window.json')).script;
   if (seen && existsSync(seen)) return { script: seen, from: '~/.dsh/see-window.json' };
+
+  if (platform === 'darwin' && existsSync(MACOS)) return { script: MACOS, from: 'macOS 独立窗口' };
 
   const watch = readJson(join(dshHome(env), 'watch-window.json')).script;
   if (watch && existsSync(watch)) return { script: watch, from: '~/.dsh/watch-window.json' };
@@ -118,36 +104,15 @@ export function resolveScript({ env = process.env } = {}) {
   return { script: null, from: null };
 }
 
-/**
- * 解释器候选：**必须有 tkinter**。
- *
- * 本机踩过的坑：`PATH` 上的 `pythonw.exe` / `python.exe` 都是 WorkBuddy managed 的，
- * **不带 tkinter**，spawn 之后立刻退（日志里刷了一排 "No module named 'tkinter'"）。
- * 真正能用的是商店版（`WindowsApps/PythonSoftwareFoundation.Python.3.13_.../python.exe`）。
- * 所以这里不能只按名字排，得**真跑一次 import** 验。
- */
 const TK_PROBE = 'import tkinter';
 
-/**
- * 这个解释器能不能 `import tkinter`？
- *
- * 导出来是为了可测 —— 本机踩过的坑就是"解释器名字对、但没有 tkinter"，
- * 光看路径判断不出来，只能真跑一次。
- */
 export function hasTkinter(python) {
-  const r = spawnSync(python, ['-c', TK_PROBE], {
+  const r = childProcess.spawnSync(python, ['-c', TK_PROBE], {
     timeout: 8000, windowsHide: true, stdio: 'ignore',
   });
   return r?.status === 0;
 }
 
-/**
- * 商店版的真实路径。
- *
- * 坑：`WindowsApps\PythonSoftwareFoundation.Python.3.13_*` 下的 `python.exe` 是
- * **App Execution Alias（重解析点）**，`existsSync()` 对它返回 false，
- * 但 `readdirSync()` 能列出、直接 spawn 也能跑。所以这里只认目录列举，不再二次探测。
- */
 function storePython() {
   const dir = join(process.env.LOCALAPPDATA ?? '', 'Microsoft', 'WindowsApps');
   const out = [];
@@ -172,35 +137,49 @@ function pythonCandidates() {
     list.push('pythonw.exe', 'python.exe', ...storePython());
   } else {
     list.push('python3', 'python');
+    if (process.platform === 'darwin') {
+      list.push('/opt/homebrew/bin/python3', '/usr/local/bin/python3');
+      try {
+        const root = '/Library/Frameworks/Python.framework/Versions';
+        for (const version of readdirSync(root).sort().reverse()) {
+          const python = join(root, version, 'bin', 'python3');
+          if (existsSync(python)) list.push(python);
+        }
+      } catch { /* 没安装 python.org 的解释器 */ }
+    }
   }
-  // 去重但保序
   return [...new Set(list.filter(Boolean))];
 }
+
+let owned = null;
+let opening = null;
+let openingController = null;
+let lastState = { alive: false, state: 'unknown', reason: null, owned: false, protocol: false };
+let pendingWindowState = null;
+const MAX_MESSAGE_BYTES = 8192;
+const QUALITIES = new Set(['low', 'standard', 'high', 'ultra']);
+const PACES = new Set(['calm', 'normal', 'dense']);
 
 /** pid 文件指向的那个进程还在不在。**不看心跳**，见 `windowPidAlive` 的注释。 */
 export function windowPidAlive() {
   if (process.env.DSH_SEE_NO_WINDOW === '1') return false;
+  if (owned) return !owned.exited;
   let pid = 0;
   try { pid = Number(readFileSync(pidPath(), 'utf8').trim()); } catch { return false; }
   if (!Number.isInteger(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); } catch { return false; }
+  try { process.kill(pid, 0); return true; } catch { return false; }
   return true;
 }
 
 /**
  * 上次开的那个还活着吗？（**"这窗还能用吗"**，决定要不要重开）
- *
- * **不能只看 pid**：pid 会被系统复用，进程也可能活着但界面卡死、或者是一张全透明的空窗。
- * 那种情况下这里一直返回 true，于是**再也不重开**，用户体感是"点了没反应"
- * （issue #2 第 3 条）。所以加一层心跳：窗口每秒 touch 一个文件，过期就当它死了。
- *
- * 没有心跳文件时**不判死**：老版本窗口不写心跳，误杀会让它每次都被重开。
- *
- * **别拿它回答"用户是不是不想看了"**：心跳 6 秒过期太容易了（机器睡一觉、
- * 主线程卡一下都算），而那个判断的代价是单向的。那个问题用 `windowPidAlive()` + 拍数，
- * 见 `loop.js` 的 `windowVerdict()`。
  */
 export function windowAlive() {
+  if (process.env.DSH_SEE_NO_WINDOW === '1') return false;
+  if (owned) {
+    if (owned.exited || ['closed', 'failed'].includes(lastState.state)) return false;
+    if (owned.protocol) return true;
+  }
   if (!windowPidAlive()) return false;
   try {
     const hb = statSync(heartbeatPath());
@@ -209,104 +188,357 @@ export function windowAlive() {
   return true;
 }
 
-/**
- * 开窗（幂等）。
- *
- * 三步都要做，少一步就会得到一个"看起来成功、其实早就退了"的窗：
- *   1. 真跑一次 `import tkinter` 验解释器（managed python 没有，会立刻退）
- *   2. spawn 之后等 700ms，看它有没有自己退出（脚本报错退出也是退）
- *   3. **确认活着才写 pid** —— 否则 pid 文件指向死进程，`windowAlive()` 永远 false
- *
- * `script` 传了就**跳过 resolveScript()**，测试靠这个把自己钉在一个注定失败的脚本上 ——
- * 否则一旦那个脚本不存在，回退链会摸到真的 window.py，测试当场把窗弹到用户脸上（踩过）。
- *
- * @returns {{ok:boolean, script?:string, python?:string, from?:string, reason?:string, already?:boolean}}
- */
-export async function openWindow({ force = false, log = () => {}, settleMs = 700, script: forced = null } = {}) {
-  if (process.env.DSH_SEE_NO_WINDOW === '1') return { ok: false, reason: 'disabled' };
-  if (!force && windowAlive()) return { ok: true, already: true };
-
-  // force、或者 pid 还在但心跳过期（进程卡死/是空窗）才会走到这儿：
-  // 先把上一次那个进程收掉，否则会叠出两个窗口，而用户只看得见一个。
-  try {
-    const old = Number(readFileSync(pidPath(), 'utf8').trim());
-    if (Number.isInteger(old) && old > 0 && old !== process.pid) {
-      try { process.kill(old); } catch { /* 已经没了 */ }
-    }
-  } catch { /* 没有 pid 文件，正常首次启动 */ }
-
-  const { script, from } = forced
-    ? { script: forced, from: '调用方指定' }
-    : resolveScript();
-  if (!script) {
-    return { ok: false, reason: '找不到 window.py（设 DSH_SEE_WINDOW，或写 ~/.dsh/see-window.json）' };
-  }
-  if (forced && !existsSync(forced)) {
-    return { ok: false, reason: `指定的 script 不存在：${forced}`, script: forced, from };
-  }
-
-  const tried = [];
-  for (const python of pythonCandidates()) {
-    if (!hasTkinter(python)) { tried.push(`${python}（无 tkinter）`); continue; }
-
-    let errFd = 'ignore';
-    try { errFd = openSync(logPath(), 'a'); } catch { /* 打不开日志就丢掉 */ }
-
-    let child;
-    try {
-      child = spawn(python, [script], {
-        stdio: ['ignore', errFd, errFd],
-        detached: true,
-        windowsHide: true,
-        env: {
-          ...process.env,
-          // 关键：窗口按这个目录找 chat.jsonl，指到我们自己的目录，
-          // 既不会读到陪看的消息，也不会把我们的消息写进陪看那条流
-          DSH_VIDEO_CACHE_DIR: chatDir(),
-        },
-      });
-    } catch (e) {
-      tried.push(`${python}（spawn 失败：${e?.message ?? e}）`);
-      if (typeof errFd === 'number') { try { closeSync(errFd); } catch { /* 已关 */ } }
-      continue;
-    }
-
-    const dead = await waitExit(child, settleMs);
-    if (typeof errFd === 'number') { try { closeSync(errFd); } catch { /* 已关 */ } }
-    if (dead) {
-      tried.push(`${python}（启动后 ${settleMs}ms 内退出，code=${dead.code}）`);
-      log(`[window] ${python} 启动后立即退出，换下一个`);
-      continue;
-    }
-
-    child.unref?.();
-    try { writeFileSync(pidPath(), String(child.pid ?? ''), 'utf8'); } catch { /* 写不了只是会多开一次 */ }
-    return { ok: true, script, from, python };
-  }
-
-  return {
-    ok: false,
-    reason: `没有能用的解释器（要带 tkinter）：${tried.join(' / ') || '一个候选都没有'}`,
-    script,
-  };
+/** 当前窗口状态；legacy 退出不等于用户主动关闭。 */
+export function windowStatus() {
+  const alive = windowAlive();
+  if (!owned && alive) return { ...lastState, alive: true, state: 'legacy', owned: false, protocol: false };
+  return { ...lastState, alive, owned: Boolean(owned && !owned.exited) };
 }
 
-/** 等最多 `ms`；进程先退出就返回 {code}，否则返回 null（还活着）。 */
-function waitExit(child, ms) {
+function update(record, state, reason = null) {
+  record.status = { alive: !record.exited, state, reason, owned: true, protocol: record.protocol };
+  if (owned !== record) return;
+  lastState = record.status;
+  for (const notify of [...record.waiters]) notify();
+}
+
+function clearPid(record) {
+  try {
+    if (readFileSync(record.pidFile, 'utf8').trim() === String(record.child.pid)) unlinkSync(record.pidFile);
+  } catch { /* 没有锁，或另一个窗口已经接管 */ }
+}
+
+function notifyClosed(record) {
+  if (record.closeNotified) return;
+  record.closeNotified = true;
+  clearPid(record);
+  const status = { ...record.status, alive: false, owned: false };
+  if (owned === record) { owned = null; lastState = status; }
+  try { record.onClose?.(status); } catch (error) {
+    record.log(`[window] onClose: ${error?.message ?? error}`);
+  }
+}
+
+function waitChange(record, ms, signal) {
   return new Promise((resolve) => {
-    let done = false;
-    const finish = (v) => { if (!done) { done = true; clearTimeout(timer); resolve(v); } };
-    const timer = setTimeout(() => finish(null), ms);
-    child.once('exit', (code, signal) => finish({ code: code ?? signal }));
-    child.once('error', (e) => finish({ code: `error:${e?.message ?? e}` }));
+    const finish = () => {
+      clearTimeout(timer);
+      record.waiters.delete(finish);
+      signal?.removeEventListener('abort', finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    record.waiters.add(finish);
+    signal?.addEventListener('abort', finish, { once: true });
+    if (signal?.aborted || record.exited) finish();
   });
 }
 
-/** 关窗（读 pid 杀掉；用户自己点 × 的话这里什么也不用做） */
-export function closeWindow() {
+async function terminate(record, reason, state = 'closed') {
+  if (record.stopping) return record.stopping;
+  record.stopReason = reason;
+  update(record, state, reason);
+  record.stopping = (async () => {
+    if (!record.exited) {
+      try { record.child.kill('SIGTERM'); } catch { /* 已退出 */ }
+      await waitChange(record, 700);
+      if (!record.exited) {
+        try { record.child.kill('SIGKILL'); } catch { /* 已退出 */ }
+        await waitChange(record, 300);
+      }
+    }
+    notifyClosed(record);
+    record.child.stdout?.destroy();
+    record.child.stdin?.destroy();
+  })();
+  return record.stopping;
+}
+
+function probeTk(python, signal) {
+  return new Promise((resolve) => {
+    childProcess.execFile(python, ['-c', TK_PROBE], {
+      timeout: 8000, windowsHide: true, signal,
+    }, (error) => resolve(!error));
+  });
+}
+
+function windowCommand(event) {
+  if (event?.version !== 1) return null;
+  const { command } = event;
+  if (['pause', 'resume', 'stop'].includes(command)) return { version: 1, command };
+  if (command === 'seek' && Number.isFinite(event.position) && event.position >= 0) {
+    return { version: 1, command, position: event.position };
+  }
+  if (command === 'watch' && event.source === 'file' && typeof event.path === 'string'
+    && event.path.trim() && event.path.length <= 4096 && !event.path.includes('\0')) {
+    return { version: 1, command, source: 'file', path: event.path };
+  }
+  if (command === 'configure' && (event.quality === undefined || QUALITIES.has(event.quality))
+    && (event.pace === undefined || PACES.has(event.pace)) && (event.quality || event.pace)) {
+    return { version: 1, command, ...(event.quality ? { quality: event.quality } : {}),
+      ...(event.pace ? { pace: event.pace } : {}) };
+  }
+  return null;
+}
+
+/** 将真实运行状态发给自建控制窗口；未就绪时只保留最后一份状态。 */
+export function sendWindowState(state) {
+  pendingWindowState = state;
+  if (!owned?.commands || owned.exited || !owned.child.stdin?.writable) return false;
   try {
-    const pid = Number(readFileSync(pidPath(), 'utf8').trim());
-    if (Number.isInteger(pid) && pid > 0) process.kill(pid);
-  } catch { /* 已经没了 */ }
-  try { unlinkSync(pidPath()); } catch { /* 本来就没有 */ }
+    const line = JSON.stringify({ version: 1, state }) + '\n';
+    if (Buffer.byteLength(line) > MAX_MESSAGE_BYTES || owned.child.stdin.writableLength > MAX_MESSAGE_BYTES * 2) return false;
+    owned.child.stdin.write(line);
+    return true;
+  } catch (error) {
+    owned?.log(`[window] state: ${error?.message ?? error}`);
+    return false;
+  }
+}
+
+/**
+ * 开窗（幂等）。
+ */
+export function openWindow(options = {}) {
+  if (options.signal?.aborted) return Promise.resolve({ ok: false, reason: 'cancelled' });
+  if (opening) return opening;
+  const controller = new AbortController();
+  openingController = controller;
+  const abort = () => controller.abort();
+  options.signal?.addEventListener('abort', abort, { once: true });
+  opening = launchWindow({ ...options, signal: controller.signal }).finally(() => {
+    options.signal?.removeEventListener('abort', abort);
+    opening = null;
+    openingController = null;
+  });
+  return opening;
+}
+
+async function launchWindow({
+  force = false, log = () => {}, settleMs = 700, readyMs = 8000,
+  script: forced = null, signal, onClose, onCommand, standalone = false,
+} = {}) {
+  if (process.env.DSH_SEE_NO_WINDOW === '1') return { ok: false, reason: 'disabled' };
+  if (!force && windowAlive()) {
+    if (!owned) lastState = { alive: true, state: 'legacy', reason: null, owned: false, protocol: false };
+    else {
+      if (typeof onClose === 'function') owned.onClose = onClose;
+      if (typeof onCommand === 'function') owned.onCommand = onCommand;
+    }
+    return { ok: true, already: true, ...windowStatus() };
+  }
+  if (owned) await terminate(owned, 'stopped');
+
+  // 如果 force 为 true，且非 owned，清理旧进程
+  if (force) {
+    try {
+      const old = Number(readFileSync(pidPath(), 'utf8').trim());
+      if (Number.isInteger(old) && old > 0 && old !== process.pid) {
+        try { process.kill(old); } catch { /* 已经没了 */ }
+      }
+    } catch { /* 正常首次启动 */ }
+  }
+
+  const { script, from } = forced ? { script: forced, from: '调用方指定' } : resolveScript();
+  if (!script) return { ok: false, reason: '找不到 window.py（设 DSH_SEE_WINDOW，或写 ~/.dsh/see-window.json）' };
+  if (forced && !existsSync(forced)) return { ok: false, reason: `指定的 script 不存在：${forced}`, script, from };
+
+  let protocol = false;
+  let commands = false;
+  try {
+    const text = readFileSync(script, 'utf8');
+    protocol = /^DSH_SEE_WINDOW_PROTOCOL = 1$/m.test(text);
+    commands = /^DSH_SEE_WINDOW_COMMANDS = 1$/m.test(text);
+  } catch { /* spawn 会报告脚本错误 */ }
+
+  const tried = [];
+  let hadTkinter = false;
+  for (const python of pythonCandidates()) {
+    if (signal.aborted) return { ok: false, reason: 'cancelled' };
+    const tkinter = await probeTk(python, signal);
+    if (signal.aborted) return { ok: false, reason: 'cancelled' };
+    if (!tkinter) { tried.push(`${python}（无 tkinter）`); continue; }
+    hadTkinter = true;
+    let child;
+    let logFd = null;
+    try {
+      mkdirSync(dshHome(), { recursive: true });
+      mkdirSync(chatDir(), { recursive: true });
+      try { logFd = openSync(logPath(), 'a'); } catch { /* 仍可启动，stderr 丢弃 */ }
+      child = childProcess.spawn(python, [script], {
+        detached: true,
+        stdio: [commands ? 'pipe' : 'ignore', 'pipe', logFd ?? 'ignore'],
+        windowsHide: true,
+        env: {
+          ...process.env,
+          DSH_VIDEO_CACHE_DIR: chatDir(),
+          DSH_SEE_WINDOW_CONFIG: join(dshHome(), 'see-window.json'),
+          DSH_SEE_WINDOW_VISIBLE: '1',
+          DSH_SEE_WINDOW_STANDALONE: standalone ? '1' : '0',
+        },
+      });
+    } catch (e) {
+      tried.push(`${python}（spawn: ${e?.message ?? e}）`);
+      continue;
+    } finally {
+      if (logFd !== null) try { closeSync(logFd); } catch { /* 已关闭 */ }
+    }
+
+    const record = {
+      child, protocol, commands, pidFile: pidPath(), exited: false,
+      waiters: new Set(), stopReason: null, onClose, onCommand, log,
+      status: { alive: true, state: 'starting', reason: null, owned: true, protocol },
+    };
+    child.stdin?.on('error', (error) => log(`[window] stdin: ${error.message}`));
+    owned = record;
+    update(record, 'starting');
+
+    let buffer = '';
+    let dropping = false;
+    child.stdout?.setEncoding?.('utf8');
+    child.stdout?.on('data', (chunk) => {
+      for (const part of chunk.toString().split(/(?<=\n)/)) {
+        if (dropping) { if (part.endsWith('\n')) dropping = false; continue; }
+        buffer += part;
+        if (Buffer.byteLength(buffer) > MAX_MESSAGE_BYTES) {
+          buffer = ''; dropping = !part.endsWith('\n'); continue;
+        }
+        if (!part.endsWith('\n')) continue;
+        const line = buffer.trimEnd(); buffer = '';
+        if (!protocol || !line.startsWith('DSH_SEE_WINDOW ')) continue;
+        try {
+          const event = JSON.parse(line.slice(15));
+          if (commands && event.version !== 1) continue;
+          if (['ready', 'closed', 'failed'].includes(event.state) && !record.stopReason) {
+            update(record, event.state, event.reason ?? null);
+          }
+          const command = commands && windowCommand(event);
+          if (command && record.onCommand && !record.stopReason && !record.exited && owned === record && record.status.state === 'ready') {
+            const { version: _version, ...action } = command;
+            Promise.resolve().then(() => record.onCommand(action)).catch((error) => {
+              log(`[window] command: ${error?.message ?? error}`);
+              sendWindowState({ ...pendingWindowState, lastError: String(error?.message ?? error).slice(0, 400) });
+            });
+          }
+        } catch { /* 外部脚本的普通输出 */ }
+      }
+    });
+
+    child.once('exit', (code, exitSignal) => {
+      record.exited = true;
+      if (!record.stopReason && !['closed', 'failed'].includes(record.status.state)) {
+        update(record, protocol || record.status.state === 'starting' ? 'failed' : 'unknown',
+          protocol ? `exit:${code ?? exitSignal}` : 'legacy-exit');
+      }
+      for (const notify of [...record.waiters]) notify();
+      notifyClosed(record);
+    });
+
+    child.once('error', (error) => {
+      record.exited = true;
+      update(record, 'failed', `spawn:${error.message}`);
+      notifyClosed(record);
+    });
+
+    child.unref?.();
+
+    const deadline = Date.now() + (protocol ? readyMs : settleMs);
+    while (!signal.aborted && !record.exited && lastState.state === 'starting' && Date.now() < deadline) {
+      await waitChange(record, Math.max(1, deadline - Date.now()), signal);
+    }
+
+    if (signal.aborted) { await terminate(record, 'cancelled'); return { ok: false, reason: 'cancelled' }; }
+    if (!protocol && !record.exited) update(record, 'legacy');
+    if (!record.exited && ['ready', 'legacy'].includes(lastState.state)) {
+      try { writeFileSync(record.pidFile, String(child.pid), 'utf8'); } catch { /* 仍以 child 追踪 */ }
+      child.stdout?.unref?.();
+      child.stdin?.unref?.();
+      if (pendingWindowState) sendWindowState(pendingWindowState);
+      return { ok: true, script, from, python, ...windowStatus() };
+    }
+
+    const reason = lastState.state === 'starting' ? 'ready-timeout' : lastState.reason ?? lastState.state;
+    if (lastState.state === 'closed') {
+      await terminate(record, reason);
+      return { ok: false, state: 'closed', reason, script };
+    }
+    await terminate(record, reason, 'failed');
+    log(`[window] ${python}: ${reason}，看 ${logPath()}`);
+    tried.push(`${python}（${reason}）`);
+  }
+
+  const category = hadTkinter ? 'window-failed' : 'dependency/tk';
+  const reason = `${hadTkinter ? '窗口启动失败' : '未找到带 tkinter 的解释器'}：${tried.join(' / ') || '没有候选'}`;
+  lastState = { alive: false, state: 'failed', reason, owned: false, protocol };
+  return { ok: false, state: 'failed', reason, category, attempts: tried, script };
+}
+
+function externalWindowMatches(pid, script) {
+  const expected = resolve(script);
+  let command;
+  if (process.platform === 'win32') {
+    const query = `$p=Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}'; if ($p) { $p.CommandLine }`;
+    const result = childProcess.spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', query],
+      { encoding: 'utf8', timeout: 3000, windowsHide: true, maxBuffer: 16384 });
+    if (result.status !== 0) return false;
+    command = result.stdout?.trim();
+  } else {
+    const result = childProcess.spawnSync('/bin/ps', ['-p', String(pid), '-o', 'command='],
+      { encoding: 'utf8', timeout: 3000, maxBuffer: 16384 });
+    if (result.status !== 0) return false;
+    command = result.stdout?.trim();
+  }
+  if (!command) return false;
+  const match = command.match(/^(?:"([^"]+)"|(\S+))\s+(.+)$/);
+  if (!match) return false;
+  const python = (match[1] ?? match[2]).replace(/\\/g, '/').split('/').pop();
+  if (!/^python(?:w)?(?:\d+(?:\.\d+)*)?(?:\.exe)?$/i.test(python)) return false;
+  const argument = match[3].replace(/^"(.*)"$/, '$1');
+  return process.platform === 'win32'
+    ? argument.replace(/\\/g, '/').toLowerCase() === expected.replace(/\\/g, '/').toLowerCase()
+    : argument === expected;
+}
+
+async function closeVerifiedExternal() {
+  let pid;
+  try { pid = Number(readFileSync(pidPath(), 'utf8').trim()); } catch { return { ok: true, already: true }; }
+  const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  if (!Number.isInteger(pid) || pid <= 0 || !alive()) {
+    try { unlinkSync(pidPath()); } catch { /* 已清理 */ }
+    return { ok: true, already: true };
+  }
+  const { script } = resolveScript();
+  if (!script || !externalWindowMatches(pid, script)) return { ok: false, reason: 'external-identity-mismatch' };
+  try { process.kill(pid, 'SIGTERM'); } catch (error) {
+    return { ok: false, reason: `close:${error.message}` };
+  }
+  const deadline = Date.now() + 1200;
+  while (alive() && Date.now() < deadline) await new Promise((done) => setTimeout(done, 50));
+  if (alive()) {
+    if (!externalWindowMatches(pid, script)) return { ok: false, reason: 'external-identity-changed' };
+    try { process.kill(pid, 'SIGKILL'); } catch (error) { return { ok: false, reason: `close:${error.message}` }; }
+    const until = Date.now() + 300;
+    while (alive() && Date.now() < until) await new Promise((done) => setTimeout(done, 50));
+  }
+  if (alive()) return { ok: false, reason: 'close-timeout' };
+  try { if (readFileSync(pidPath(), 'utf8').trim() === String(pid)) unlinkSync(pidPath()); } catch { /* 已清理 */ }
+  return { ok: true };
+}
+
+/** 关闭自建 child；只有 CLI 显式请求 verifiedExternal 时才核对并关闭外部窗口。 */
+export async function closeWindow({ ownedOnly = true, verifiedExternal = false } = {}) {
+  openingController?.abort();
+  if (owned) {
+    await terminate(owned, 'stopped');
+  } else if (verifiedExternal) {
+    return closeVerifiedExternal();
+  }
+  if (!windowPidAlive()) {
+    try { unlinkSync(pidPath()); } catch { /* 已清理 */ }
+  }
+  if (opening) await opening;
+  if (!windowPidAlive()) {
+    try { unlinkSync(pidPath()); } catch { /* 已清理 */ }
+  }
+  return { ok: true };
 }
