@@ -425,7 +425,8 @@ export function createRunner({ ffmpegPath = 'ffmpeg', log = () => {}, graceSec =
       const t0 = Date.now();
       try {
         const prevSrc = source ?? lastSource;
-        const switching = Boolean(pipeline) && q && SIZES[q] && q !== quality;
+        const switching = Boolean(q && SIZES[q] && q !== quality);
+        if (switching) delivery = null;
         // 管线参数变了（常规 ↔ 逐帧）：这两套口径建管线时就定死了，只能重开。
         const modeChanged = Boolean(pipeline) && optsSig(runOpts) !== optsSig(opts);
         /**
