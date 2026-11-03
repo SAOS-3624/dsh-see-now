@@ -61,7 +61,7 @@ export function checkRegion(region, { allowNegative = false } = {}) {
 /** 保留底层证据；只有明确的 stderr 才归类权限或设备错误。 */
 export function captureErrorInfo(error, stage = 'exit') {
   if (error?.errorInfo) return error.errorInfo;
-  const message = String(error?.message ?? error);
+  const message = `${error?.message ?? error}\n${error?.stderrTail ?? ''}`;
   const category = error?.code === 'ENOENT' || /找不到 FFmpeg|spawn.*ENOENT/i.test(message) ? 'dependency-missing'
     : error instanceof RangeError ? 'invalid-input'
       : /permission denied|not authorized|operation not permitted|screen recording permission/i.test(message) ? 'permission-denied'

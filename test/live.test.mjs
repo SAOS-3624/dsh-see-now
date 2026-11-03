@@ -287,10 +287,10 @@ test('captureErrorInfo：依据明确证据将异常分类，保留底层 stage�
   const c2 = captureErrorInfo(range, 'validate');
   assert.equal(c2.category, 'invalid-input');
 
-  const perm = Object.assign(new Error('AVFoundation: permission denied'), { stderrTail: 'permission denied' });
+  const perm = Object.assign(new Error('ffmpeg exit 1'), { stderrTail: 'screen recording permission denied' });
   const c3 = captureErrorInfo(perm, 'exit');
   assert.equal(c3.category, 'permission-denied');
-  assert.equal(c3.stderrTail, 'permission denied');
+  assert.equal(c3.stderrTail, 'screen recording permission denied');
 
   const devErr = new Error('video device not available: Could not find video device');
   const c4 = captureErrorInfo(devErr);
