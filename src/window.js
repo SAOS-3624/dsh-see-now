@@ -329,16 +329,6 @@ async function launchWindow({
   }
   if (owned) await terminate(owned, 'stopped');
 
-  // 如果 force 为 true，且非 owned，清理旧进程
-  if (force) {
-    try {
-      const old = Number(readFileSync(pidPath(), 'utf8').trim());
-      if (Number.isInteger(old) && old > 0 && old !== process.pid) {
-        try { process.kill(old); } catch { /* 已经没了 */ }
-      }
-    } catch { /* 正常首次启动 */ }
-  }
-
   const { script, from } = forced ? { script: forced, from: '调用方指定' } : resolveScript();
   if (!script) return { ok: false, reason: '找不到 window.py（设 DSH_SEE_WINDOW，或写 ~/.dsh/see-window.json）' };
   if (forced && !existsSync(forced)) return { ok: false, reason: `指定的 script 不存在：${forced}`, script, from };
@@ -416,11 +406,11 @@ async function launchWindow({
           if (command && record.onCommand && !record.stopReason && !record.exited && owned === record && record.status.state === 'ready') {
             const { version: _version, ...action } = command;
             Promise.resolve().then(() => {
-              if (owned !== record || record.exited || record.stopReason) return;
+              if (owned !== record || record.exited || record.stopReason || record.status.state !== 'ready') return;
               return record.onCommand(action);
             }).catch((error) => {
               log(`[window] command: ${error?.message ?? error}`);
-              if (owned === record) {
+              if (owned === record && !record.exited && !record.stopReason && record.status.state === 'ready') {
                 sendWindowState({ ...pendingWindowState, lastError: String(error?.message ?? error).slice(0, 400) });
               }
             });

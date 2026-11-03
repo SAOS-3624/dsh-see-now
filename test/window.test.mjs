@@ -303,7 +303,11 @@ test('CLI 独立窗口传 standalone 标志，仍等 ready 再返回', async (t)
     queueMicrotask(() => child.stdout.write('DSH_SEE_WINDOW {"version":1,"state":"ready"}\n'));
     return child;
   });
-  assert.equal((await openWindow({ script: MACOS, standalone: true })).state, 'ready');
+  writeFileSync(pidPath(), '2147483403');
+  const externalSignals = [];
+  t.mock.method(process, 'kill', (_pid, signal) => { if (signal !== 0) externalSignals.push(signal); });
+  assert.equal((await openWindow({ script: MACOS, standalone: true, force: true })).state, 'ready');
+  assert.deepEqual(externalSignals, [], 'force 只清自建 child，外部 PID 需走 verifiedExternal');
   await closeWindow();
 });
 
@@ -330,6 +334,11 @@ test('旧窗口已替换时，旧 child 的延迟命令被忽略', async (t) => 
   firstChild.stdout.write('DSH_SEE_WINDOW {"version":1,"command":"pause"}\n');
   await new Promise((r) => setImmediate(r));
   assert.equal(received.length, 0, '旧 child 的命令必须被丢弃');
+  const current = children.at(-1);
+  current.stdout.write('DSH_SEE_WINDOW {"version":1,"command":"pause"}\n');
+  current.stdout.write('DSH_SEE_WINDOW {"version":1,"state":"closed","reason":"user"}\n');
+  await new Promise((r) => setImmediate(r));
+  assert.equal(received.length, 0, '微任务执行前已关闭的窗口不得再发控制命令');
   await closeWindow();
 });
 
