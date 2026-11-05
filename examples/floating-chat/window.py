@@ -104,8 +104,25 @@ try:  # 悬浮窗接口：插件写 window-events.jsonl，窗口回 window-outbo
 except Exception:
     WindowProtocol = None
 
-INTERVAL_MS = 4
-MAX_FPS = 120
+
+def _max_fps() -> int:
+    """目标帧率上限，默认 60；120Hz 玻璃可显式开回 120。
+
+    120fps 的一帧预算只有 8.3ms，而单次 mss 抓屏约 7ms，再叠 CPU 合成，
+    预算已经贴边；低配机/高分屏/动态桌面会一直落在“差一点来得及”的区间。
+    默认 60fps 把预算抬到 16.6ms，显示线程也不再用 4ms 定时器空转。
+    """
+    try:
+        fps = int(os.environ.get("DSH_GLASS_MAX_FPS", "60"))
+    except (TypeError, ValueError):
+        fps = 60
+    return max(30, min(120, fps))
+
+
+MAX_FPS = _max_fps()
+# 主线程按目标帧率唤醒；旧值固定 4ms（250Hz），后台却按 120fps 合成，
+# 抓屏 + 合成一旦超过 8.3ms，主线程还在空转堆积 after 回调。
+INTERVAL_MS = max(4, int(1000 / MAX_FPS))
 # 静止画面下「有没有变」只能靠抓屏看，单次 grab ~7ms；空转按 60fps 就是 40% 单核。
 # 降到 30fps 探针，有变化时 idle 立刻归零、下一拍恢复全速。
 PROBE_FPS = 30
@@ -408,6 +425,7 @@ class LiveGlass:
         self._hz = display_hz()
         self._target_fps = min(MAX_FPS, self._hz)
         self._ema = 1.0 / max(1, self._target_fps)
+        self._draw_ms = 0.0       # Tk 主线程实际绘制耗时，用来给 after 留余量
         self._last_motion = 0.0
 
         self.feed.reload()
@@ -1269,7 +1287,9 @@ class LiveGlass:
             out = self._q.get_nowait()
         except queue.Empty:
             out = None
+        delay = INTERVAL_MS
         if out is not None:
+            t_draw = time.perf_counter()
             try:
                 self._last_frame = out
                 self._img = ImageTk.PhotoImage(out, master=self.canvas)
@@ -1279,8 +1299,13 @@ class LiveGlass:
                 self._adapt_bar(out)
             except Exception as exc:
                 print("draw error", exc, flush=True)
+            cost_ms = (time.perf_counter() - t_draw) * 1000.0
+            self._draw_ms = self._draw_ms * 0.8 + cost_ms * 0.2
+            # 主线程绘制本身超过一帧预算时，别按固定 16ms 硬塞下一帧：
+            # 给 Tk 留出处理鼠标/键盘的时间，否则事件队列越积越长，手感就是卡。
+            delay = max(INTERVAL_MS, min(100, int(self._draw_ms * 1.5)))
 
-        self.root.after(INTERVAL_MS, self._tick)
+        self.root.after(delay, self._tick)
 
     def _work(self) -> None:
         """抓取 + 合成全在后台，主线程只负责显示最新一帧。"""
@@ -1314,13 +1339,16 @@ class LiveGlass:
                 dt = time.perf_counter() - t0
                 self._ema = self._ema * 0.9 + dt * 0.1
                 if self._ema > 0.026:
-                    self._target_fps = 45
+                    target = 45
                 elif self._ema > 0.016:
-                    self._target_fps = 60
+                    target = 60
                 elif self._ema > 0.011:
-                    self._target_fps = 90
+                    target = 90
                 else:
-                    self._target_fps = min(MAX_FPS, self._hz)
+                    target = MAX_FPS
+                # 自适应只能往下走；不能越过启动时的上限（默认 60），
+                # 否则 120fps 的旧阈值会把已经设成 60 的窗口又抬回 90fps。
+                self._target_fps = max(30, min(target, MAX_FPS, self._hz))
                 # 静态画面：合成已经跳过，但「有没有变」只能靠抓屏看，单次 grab
                 # 就要 ~7ms —— 按 60fps 空转等于白烧 40% 单核。探针降到 30fps，
                 # 有变化时 idle 立刻归零、下一拍就恢复全速（最坏多等 33ms，
