@@ -22,7 +22,7 @@ import { createPipeline } from './pipeline.js';
 import { cellSize } from './layout.js';
 import { chatWatcherShared, enterChatWait } from './chat.js';
 import { noteInterjected } from './interject.js';
-import { openWindow, pidStamp, windowAlive, setWindowHidden } from './window.js';
+import { openWindow, pidStamp, windowAlive, setWindowHidden, sendWindowState } from './window.js';
 import { createListener } from './listen.js';
 
 /**
@@ -401,6 +401,7 @@ export function createRunner({
     // 探针已经试出来了，这里把它带回去，让模型（和用户）知道该去系统设置，而不是以为插件坏了。
     const warning = s.kind === 'screen' ? screenEngineWarning() : null;
     if (warning) log(`⚠️ ${warning}`);
+    playbackState = 'playing'; playbackPosition = s.seek ?? playbackPosition; publishPlayback();
     return { started: true, source: s, engine, quality, params: p.constants, warning };
   }
 
@@ -413,10 +414,16 @@ export function createRunner({
    * 注意是 await：要真跑一次 `import tkinter` 验解释器、再等 700ms 看它有没有退出，
    * 不然会拿到一个"成功"但其实早就退了的窗（pid 指向死进程）。
    */
+  let playbackState = 'stopped', playbackPosition = 0;
+  function publishPlayback() { sendWindowState({ playback: playbackState, positionSec: playbackPosition }); }
+  async function pause() { if (source?.kind !== 'file') return { ok:false, reason:'not-file' }; playbackState='paused'; run?.pause(); publishPlayback(); return { ok:true, playback:playbackState, positionSec:playbackPosition }; }
+  async function resume() { if (source?.kind !== 'file') return { ok:false, reason:'not-file' }; playbackState='playing'; run?.resume(); publishPlayback(); return { ok:true, playback:playbackState, positionSec:playbackPosition }; }
+  async function seek(position) { if (source?.kind !== 'file' || !Number.isFinite(position) || position < 0) return { ok:false, reason:'invalid-position' }; playbackPosition=position; await start({ src:{...source, seek:position}, preservePosition:true }); publishPlayback(); return { ok:true, playback:playbackState, positionSec:playbackPosition }; }
+  async function configure(options={}) { if (source?.kind !== 'file') return { ok:false, reason:'not-file' }; await start({ src:source, quality:options.quality, preservePosition:true }); publishPlayback(); return { ok:true, playback:playbackState, positionSec:playbackPosition }; }
   async function ensureWindow() {
     if (windowState?.ok) return windowState;
     if (windowPending) return windowPending;
-    windowPending = openWindow({ log }).then((st) => {
+    windowPending = openWindow({ log, onCommand: async () => {} }).then((st) => {
       windowState = st;
       if (st.ok) {
         windowOpened = true;
@@ -786,7 +793,10 @@ export function createRunner({
         // 听声音的状态。"它好像没听见台词"时第一个要看的就是它：
         // enabled=false 的 reason 会直接说是缺服务、缺 Python、还是抓不到回环设备
         listen: listener.state(),
+        playback: playbackState,
+        positionSec: playbackPosition,
       };
     },
+    pause, resume, seek, configure,
   };
 }

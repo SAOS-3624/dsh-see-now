@@ -137,9 +137,11 @@ export function sourceArgs(
       // ddagrab 是 filter source，输入侧没有帧率参数
       return ['-f', 'lavfi', '-i', `ddagrab=framerate=${fps}:draw_mouse=${s.mouse ? 1 : 0}`];
     }
-    case 'file':
-      // `realtime` 才加 -re；离线跑要看的是「管线本身多快」，不能被播放速度骗了
-      return [...(s.realtime ? ['-re'] : []), '-i', String(s.path)];
+    case 'file': {
+      const seek = s.seek ?? s.startSec;
+      if (seek != null && (!Number.isFinite(seek) || seek < 0)) throw new RangeError('file seek 必须是非负秒数');
+      return [...(s.realtime ? ['-re'] : []), ...(seek > 0 ? ['-ss', String(seek)] : []), '-i', String(s.path)];
+    }
     case 'rtmp':
       return s.listen === false ? ['-i', String(s.url)] : ['-listen', '1', '-i', String(s.url)];
     default:
@@ -211,7 +213,7 @@ export function captureArgs({
  * @returns {{stop:()=>void, done:Promise<{frames:number, ms:number, code:number|null}>}}
  */export function spawnFrames({
   source, width, height, fps, ffmpegPath = 'ffmpeg', engine = 'auto',
-  onFrame, onStderr = null, onFirst = null,
+  onFrame, onStderr = null, onFirst = null, baseSec = source?.seek ?? source?.startSec ?? 0,
 } = {}) {
   const args = captureArgs({ source, width, height, fps, ffmpegPath, engine }).slice(1);
   const child = spawn(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });

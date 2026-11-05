@@ -686,6 +686,10 @@ async function registerAll(ctx) {
         log(t.replace(/\*\*/g, ''));
       }
 
+      if (['pause','resume','seek','configure'].includes(action)) {
+        const result = action === 'seek' ? await runner.seek(args.position) : action === 'configure' ? await runner.configure({ quality: args.quality }) : await runner[action]();
+        return { text: result.ok ? `文件操作完成：${action}` : `文件操作未完成：${result.reason}`, meta: result };
+      }
       if (action === 'watch') {
         // **循环的 owner 必须在等待开始前锁定**。`runner.watch()` 会阻塞 15~40 秒，
         // 这期间任何会话的 `session/event` 都会改写 `lastSessionId`；等它返回再

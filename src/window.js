@@ -341,12 +341,17 @@ export function windowPidAlive() {
  * 主线程卡一下都算），而那个判断的代价是单向的。那个问题用 `windowPidAlive()` + 拍数，
  * 见 `loop.js` 的 `windowVerdict()`。
  */
-export function windowAlive() {
-  if (protocol) return protocolAlive();
-  if (!windowPidAlive()) return false;
+function heartbeatFresh() {
   try {
     const hb = statSync(heartbeatPath());
-    if ((Date.now() - hb.mtimeMs) / 1000 > HEARTBEAT_STALE_SEC) return false;
+    return (Date.now() - hb.mtimeMs) / 1000 <= HEARTBEAT_STALE_SEC;
+  } catch { return null; }
+}
+export function windowAlive() {
+  if (protocol) return protocolAlive() && heartbeatFresh() !== false;
+  if (!windowPidAlive()) return false;
+  try {
+    if (heartbeatFresh() === false) return false;
   } catch { /* 没有心跳文件：兼容老窗口，继续信任 pid */ }
   return true;
 }
