@@ -423,7 +423,9 @@ export function createRunner({
   async function ensureWindow() {
     if (windowState?.ok) return windowState;
     if (windowPending) return windowPending;
-    windowPending = openWindow({ log, onCommand: async () => {} }).then((st) => {
+    // 当前 window.py 使用文件协议，不会向 stdout 发 ready。这里保持 legacy，
+    // 避免协议状态永远停在 starting，导致每个 watch 都重新开窗。
+    windowPending = openWindow({ log }).then((st) => {
       windowState = st;
       if (st.ok) {
         windowOpened = true;
