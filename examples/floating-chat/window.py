@@ -402,6 +402,11 @@ def danmaku_wanted(cfg=None) -> bool:
 
 
 def danmaku_options(cfg=None) -> dict:
+    """弹幕的几何 + 外观。六个键都能在 `watch-window.json` 里手改。
+
+    外观三项（2026-11 加）：13px 在 2560×1440 上偏小（用户实报），字号/字色/描边
+    现在可配；非法值由 `danmaku.py` 那边退回默认，这里只做原样透传。
+    """
     if cfg is None:
         cfg = read_config()
     cfg = cfg or {}
@@ -414,9 +419,17 @@ def danmaku_options(cfg=None) -> dict:
     except (TypeError, ValueError):
         lanes = 2
     edge = str(cfg.get("danmakuEdge") or "top").strip().lower()
+    try:
+        font_size = int(cfg.get("danmakuFontSize"))
+    except (TypeError, ValueError):
+        font_size = None
     return {"edge": edge if edge in DANMAKU_EDGES else "top",
             "lanes": max(1, min(3, lanes)),
-            "speed": max(40, min(400, speed))}
+            "speed": max(40, min(400, speed)),
+            "font_family": str(cfg.get("danmakuFont") or "").strip() or None,
+            "font_size": font_size,
+            "fg": str(cfg.get("danmakuFg") or "").strip() or None,
+            "shadow": str(cfg.get("danmakuShadow") or "").strip() or None}
 
 
 def append_user(text: str) -> None:
