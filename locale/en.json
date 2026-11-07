@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "See Now",
+    "description": "Let the model watch your screen or camera live: keep only frames whose picture changed enough, pack them into one image, and spend almost nothing on a static screen.",
+    "detail": "docs/plugin.md"
+  }
+}

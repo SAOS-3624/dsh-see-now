@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "看见（See Now）",
+    "description": "让 AI 实时看见屏幕或摄像头，只保留画面变化够大的帧，压成一张图，静止画面几乎不花钱。",
+    "detail": "docs/plugin.zh.md"
+  }
+}

@@ -32,7 +32,9 @@
     "./runner": "./src/runner.js",
     "./loop": "./src/loop.js",
     "./timer": "./src/timer.js",
-    "./tool-spec": "./src/tool-spec.js"
+    "./tool-spec": "./src/tool-spec.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
   },
   "files": [
     "bin",
@@ -41,6 +43,8 @@
     "examples/floating-chat/*.png",
     "examples/voice-say-mac.mjs",
     "scripts",
+    "locale",
+    "docs",
     "client.js",
     "cordis.patch.yml",
     "dsh.plugin.json",
