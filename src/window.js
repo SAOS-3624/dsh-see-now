@@ -32,6 +32,25 @@ import { chatDir, dshHome } from './chat.js';
 const HERE = dirname(fileURLToPath(import.meta.url));
 /** 包里自带的那份 —— 由 `scripts/sync-window.mjs` 从上游生成，是最后的兜底 */
 export const PACKAGED = join(HERE, '..', 'examples', 'floating-chat', 'window.py');
+
+/**
+ * 非 Windows 上默认给窗口加 `DSH_GLASS_FROST=1`（静态磨砂）。
+ *
+ * `live`（实时玻璃）要**抓窗口背后的像素**再模糊合成：Wayland 上拿不到原生窗口背后的内容、
+ * macOS 上没给"屏幕录制"时也全是黑，结果就是整窗发黑（issue #45 / PR #38 都撞到）。
+ * `frost` 不抓屏，任何时候都看得见；窗口本身仍是那张 KEY 底色的深色卡片（非 Windows 的
+ * 既定形态），只是不再尝试实时合成。
+ *
+ * 用户显式选过样式（`~/.dsh/watch-window.json` 的 `glass`）就不覆盖。
+ */
+export function defaultGlassEnv({ platform = process.platform, home = dshHome() } = {}) {
+  if (platform === 'win32') return {};
+  try {
+    const cfg = JSON.parse(readFileSync(join(home, 'watch-window.json'), 'utf8')) || {};
+    if (String(cfg.glass ?? '').trim()) return {};
+  } catch { /* 没配置 = 没选过 */ }
+  return { DSH_GLASS_FROST: '1' };
+}
 const REL = join('examples', 'floating-chat', 'window.py');
 
 function readJson(p) {
@@ -617,6 +636,7 @@ export async function openWindow({ force = false, log = () => {}, settleMs = 700
         detached: true,
         windowsHide: true,
         env: {
+          ...defaultGlassEnv(),
           ...process.env,
           // 关键：窗口按这个目录找 chat.jsonl，指到我们自己的目录，
           // 既不会读到陪看的消息，也不会把我们的消息写进陪看那条流

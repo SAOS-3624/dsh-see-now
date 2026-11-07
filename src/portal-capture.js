@@ -55,7 +55,26 @@ export const PORTAL_HINTS = Object.freeze({
     + '是否在跑（systemctl --user status xdg-desktop-portal）。',
 });
 
-/** 找 python。DSH_PYTHON_PATH 显式指定优先，其次 PATH 里的 python3。 */
+/**
+ * 找 **worker** 用的 python。
+ *
+ * worker 只需要 PyGObject（`gi`），它装在**系统** python 里；而 `DSH_SEE_PYTHON` 的典型用途是
+ * 指到一个装了 PySide6 的 venv（指示框要 PySide6）。两者共用同一个解释器时，
+ * venv 里没有 `gi`，worker 一启动就 `No module named 'gi'` —— 采集直接挂。
+ *
+ * 所以这里默认固定系统 `python3`；确实要换，用专门的 `DSH_SEE_WORKER_PYTHON`。
+ */
+export function resolveWorkerPython({ env = process.env } = {}) {
+  const explicit = env.DSH_SEE_WORKER_PYTHON;
+  if (explicit) return explicit;
+  return 'python3';
+}
+
+/**
+ * 找 python（**指示框**用）：`DSH_PYTHON_PATH` / `DSH_SEE_PYTHON` 显式指定优先，其次 `python3`。
+ *
+ * 注意它**不**用于采集 worker —— 见 `resolveWorkerPython()`。
+ */
 export function resolvePython({ env = process.env } = {}) {
   const explicit = env.DSH_PYTHON_PATH || env.DSH_SEE_PYTHON;
   if (explicit) return explicit;
@@ -86,7 +105,7 @@ function classify(code, stderrTail) {
  */
 export function spawnPortalFrames({
   width, height, fps = 12,
-  pythonPath = resolvePython(),
+  pythonPath = resolveWorkerPython(),
   workerPath = WORKER,
   // 指示框裁剪：{logicalWidth, logicalHeight, edge, top}（全是**逻辑像素**）
   crop = null,

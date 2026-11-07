@@ -344,8 +344,19 @@ class CaptureSource:
 
 
 def finish(geo: Geometry, panel: Image.Image) -> Image.Image:
-    """贴二值圆角遮罩；缝隙/圆角外是 KEY，被 Tk 抠成透明。"""
-    out = Image.new("RGB", (geo.width, geo.height), KEY)
+    """贴二值圆角遮罩。
+
+    Windows 上圆角/阴影边距填 KEY，由 Tk 的 ``-transparentcolor`` 抠成透明；
+    其它平台没有这个属性（Tk 也不支持 per-pixel alpha，填真透明会变纯黑），
+    所以边距直接填**面板自己的底色** —— 视觉上是一整块卡片，不再是黑框。
+    """
+    base = KEY
+    if os.name != "nt":
+        try:
+            base = panel.convert("RGB").resize((1, 1), Image.LANCZOS).getpixel((0, 0))
+        except Exception:
+            base = KEY
+    out = Image.new("RGB", (geo.width, geo.height), base)
     out.paste(panel.convert("RGB"), (0, 0), geo.mask_hard)
     return out
 

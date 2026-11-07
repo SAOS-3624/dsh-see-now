@@ -212,8 +212,12 @@ portal 握手（一次授权，restore_token 存 ~/.dsh/see-now/portal-token.jso
 | tkinter + Pillow + mss + numpy（只用于悬浮窗，上游 `window.py`） | `tk` `python-pillow` `python-mss` `python-numpy` | `python3-tk` `python3-pil` `python3-mss` `python3-numpy` | **采集照旧**，窗打不开；Wayland 下建议设置里选 `frost`/`solid`（这两档不抓屏） |
 | ffmpeg（只用于 `source:"file"` / `"rtmp"`） | `ffmpeg` | `ffmpeg` | 屏幕采集不受影响 |
 
-PySide6 装进 venv 之后，用 `DSH_SEE_PYTHON=~/.venvs/pyside/bin/python` 指给插件；Qt 的 xcb 插件
+PySide6 装进 venv 之后，用 `DSH_SEE_PYTHON=~/.venvs/pyside/bin/python` 指给**指示框**；Qt 的 xcb 插件
 还需要 `libxcb-cursor0`（Ubuntu 上不装会 `Could not load the Qt platform plugin "xcb"`）。
+
+**采集 worker 不吃这个变量**：它要的是系统 python 里的 `gi`（PyGObject），而 PySide6 的 venv 里
+一般没有。worker 默认就是 `python3`，确实要换用 `DSH_SEE_WORKER_PYTHON`。
+如果想让一个解释器两用，venv 得带系统包：`python3 -m venv --system-site-packages ~/.venvs/dsh`。
 
 - **静止画面**：Mutter/KWin 只在有 damage 时发帧，所以 gst 加了 `keepalive-time=250`
   （每 250ms 重发最后一帧），否则桌面不动时一帧都不来。
@@ -225,9 +229,12 @@ PySide6 装进 venv 之后，用 `DSH_SEE_PYTHON=~/.venvs/pyside/bin/python` 指
   握手成功但 0 帧、不报错）；正常 stop 会调 `Session.Close`，不会留下这个状态。
   真卡住了：`systemctl --user restart xdg-desktop-portal`（GNOME 上还要重启
   `xdg-desktop-portal-gnome`）。
-- **悬浮窗**：用的是上游 `window.py`。它在 Linux 上要 0.2.15+（`42d2f91` 起 ctypes.windll
-  已按平台收口）；`-transparentcolor` 这个 Windows 专有 Tk 属性还需要平台判断，
-  否则仍会 `TclError`（见 issue #40）。
+- **悬浮窗**：用的是上游 `window.py`。非 Windows 上默认走 `frost`（静态磨砂）—— `live`
+  要抓窗口背后的像素，而 Wayland 拿不到、macOS 没给屏幕录制权限时也是黑的，整窗会发黑
+  （issue #45 / PR #38）。想改回实时玻璃或纯色：设置页选，或 `~/.dsh/watch-window.json`
+  写 `{"glass": "live"}`。
+- 非 Windows 上窗口是**一张 `KEY(#010203)` 底色的深色卡片、四角直角**——`-transparentcolor`
+  是 Windows 专有，这里不做透明（Tk 在 X11/Wayland 也不合成 per-pixel alpha）。
 
 然后让模型调：
 
