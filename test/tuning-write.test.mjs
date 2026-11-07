@@ -93,6 +93,16 @@ test('文件里原本有历史错误时，合法提交照样能存', () => {
   assert.match(r.warnings[0], /maxAutonomousWakes/);
 });
 
+test('历史坏值不会让另一个坏值蒙混过关', () => {
+  // 先手写一个坏 tierStyle；再提交另一个坏值。旧实现两句警告一模一样，
+  // `added` 为空会放行，然后静默把值写成默认值。
+  const fs = memFs(JSON.stringify({ tierStyle: 'foo' }));
+  const r = writeTuning({ tierStyle: 'bar' }, opts(fs));
+  assert.equal(r.ok, false);
+  assert.match(r.rejected[0], /tierStyle/);
+  assert.equal(stored(fs).tierStyle, 'foo', '拒写时文件不能动');
+});
+
 test('listen 是浅合并，不冲掉同段其它键', () => {
   const fs = memFs(JSON.stringify({ listen: { silence: 0.5, pollMs: 200 } }));
   const r = writeTuning({ listen: { silence: 0.7 } }, opts(fs));

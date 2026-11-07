@@ -281,7 +281,12 @@ export function readTuning({ env = process.env, readFile = readFileSync } = {}) 
   if (raw.tierStyle !== undefined) {
     const want = String(raw.tierStyle ?? '').trim();
     if (TIER_STYLES.includes(want)) tierStyle = want;
-    else warnings.push(`tierStyle 只能是 ${TIER_STYLES.join(' / ')}，已用默认 native`);
+    else {
+      // 警告里带上提交值：`writeTuning` 靠“警告是否变多”判断本次提交是否合法。
+      // 如果两条不同的坏值产生同一句警告，历史坏值会遮住新坏值，用户看到保存成功，
+      // 实际却被静默换成默认值。
+      warnings.push(`tierStyle 只能是 ${TIER_STYLES.join(' / ')}（收到 ${JSON.stringify(want)}），已用默认 ${TUNING_DEFAULTS.tierStyle}`);
+    }
   }
 
   /**
