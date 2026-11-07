@@ -118,6 +118,20 @@ export const LISTEN_DEFAULTS = Object.freeze({
    * 带字级时间码），而原来写死宿主优先，等于自己搭了服务也用不上。
    */
   prefer: 'auto',
+  /**
+   * 声音从哪来（Windows）。`auto` 先试进程回环，起不来回落设备回环；`device` 是老的整机回环；
+   * `process` 只抓目标进程树 —— TTS 在别的进程里，天然不会"听见自己"（issue #34）。
+   *
+   * 默认 `auto`：新系统上自动变好，旧系统/没目标进程时行为与以前完全一样。
+   */
+  source: 'auto',
+  /**
+   * 进程回环抓谁（进程名，如 `chrome.exe`）。留空 = 自动找"正在出声、且不是播放器"的那个。
+   *
+   * 为什么不默认写 `chrome.exe`：看视频的可能是 Chrome / Edge / mpv / PotPlayer，
+   * 写死一个等于对别的用户失效；自动挑 + 配置覆盖才是 #34 讨论出来的形态。
+   */
+  targetProcess: '',
   /** 长句「边说边出字幕」：说满 `liveMin` 秒就先转一版，整句落盘后覆盖它。 */
   live: true,
   /** 说满这么多秒才发第一版快照。1.0 秒的片段质量明显掉（实测丢一半），1.5 可用，1.8 稳。 */
@@ -142,6 +156,9 @@ export const PACES_KEYS = Object.freeze(['calm', 'normal', 'dense', 'game-econom
  * `host` / `local` 是严格的（找不到就明说没有，不换一个顶上）。
  */
 export const PREFER_KEYS = Object.freeze(['auto', 'host', 'local']);
+
+/** 采集来源：`auto`（先进程回环、失败回退）、`device`（老行为）、`process`（只抓目标进程）。 */
+export const LISTEN_SOURCES = Object.freeze(['auto', 'device', 'process']);
 
 /**
  * 档位映射的四种取法。
@@ -183,6 +200,15 @@ function readListen(raw) {
   if (src.prefer !== undefined) {
     if (PREFER_KEYS.includes(src.prefer)) out.prefer = src.prefer;
     else bad.push(`listen.prefer 只能是 ${PREFER_KEYS.join(' / ')}，已用默认 auto`);
+  }
+  if (src.source !== undefined) {
+    if (LISTEN_SOURCES.includes(src.source)) out.source = src.source;
+    else bad.push(`listen.source 只能是 ${LISTEN_SOURCES.join(' / ')}，已用默认 auto`);
+  }
+  if (src.targetProcess !== undefined) {
+    if (typeof src.targetProcess !== 'string') bad.push('listen.targetProcess 必须是字符串（进程名）');
+    else if (src.targetProcess.length > 120) bad.push('listen.targetProcess 太长（>120 字符），已忽略');
+    else out.targetProcess = src.targetProcess.trim();
   }
   if (src.live !== undefined) {
     if (typeof src.live === 'boolean') out.live = src.live;
@@ -423,7 +449,7 @@ export const WRITABLE_KEYS = Object.freeze([
 
 /** `listen` 段能改的键。 */
 export const WRITABLE_LISTEN_KEYS = Object.freeze([
-  'prefer', 'live', 'liveMin', 'liveStep', 'silence', 'maxSeg', 'pollMs',
+  'prefer', 'source', 'targetProcess', 'live', 'liveMin', 'liveStep', 'silence', 'maxSeg', 'pollMs',
 ]);
 
 /**

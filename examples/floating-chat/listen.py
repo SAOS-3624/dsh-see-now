@@ -29,12 +29,29 @@ ffmpeg 的 dshow 也走不通：这台机器 dshow 枚举不到"立体声混音"
 3. **它听得见自己**。AI 用 TTS 念台词 → 音箱出声音 → 回环收回去 → 转成"视频里的台词"。
    所以每段落盘前查一次 `quiet-until.json`（`say` / `cue` 念之前会占住这个窗口）。
 
+   **分声源之后这条不适用**（`--source process`）：TTS 从别的进程出来，根本进不了这条流；
+   再按窗口丢段只会把**真实台词**误杀 —— 实测踩过：TTS 连着念的 128 秒里，视频里的话
+   一直在说、也一直在断句，但每句的起点都落在 quiet-until 里 → 全被丢掉 → "连续人声
+   128 秒没有一条定稿句"。所以进程回环下 `tts_busy()` 直接不生效；回退到设备回环时照旧。
+
+## 两种声音来源（`--source`，Windows）
+
+  · `device`（老行为）：整机回环 —— 什么都收，包括 AI 自己的 TTS（靠 quiet-until 装聋补）；
+  · `process`：只抓目标进程那棵进程树，TTS 从别的进程出来的声音根本进不来；
+  · `auto`（默认）：先试进程回环，起不来（旧系统 / 没有目标进程 / 激活失败）回落设备回环。
+
+进程回环在 `procloopback.py`（纯 ctypes，不增加运行时依赖），这里只管"选哪条路 + 回退"。
+**任何一步失败都不许静音**：进程回环起不来就回落设备回环，行为与以前一致，只是继续有
+"可能听见自己"的老毛病 —— 这也是 #34 里作者要求的最小形态（只在 Windows 生效、失败自动回退）。
+
 ## 用法
 
     python listen.py --out ~/.dsh/see-now/audio
     python listen.py --out ... --device "耳机 (Realtek(R) Audio) [Loopback]"
     python listen.py --out ... --list-devices
     python listen.py --out ... --silence 0.35 --max-seg 8
+    python listen.py --out ... --source process --process chrome.exe
+    python listen.py --out ... --source process --pid 1234      # 调试：直接钉死 PID
 
 依赖：`pip install pyaudiowpatch numpy`。装不上就退出码 2，上层据此静默降级（只看图，无字幕）。
 
@@ -49,6 +66,7 @@ import os
 import queue
 import signal
 import sys
+import threading
 import time
 import wave
 
@@ -69,6 +87,11 @@ try:
 except ImportError:
     sys.stderr.write("缺 pyaudiowpatch：pip install pyaudiowpatch\n")
     raise SystemExit(2)
+
+try:
+    import procloopback as _procloopback   # 同目录；纯 ctypes，Windows 10 2004+
+except Exception:                          # 非 Windows / 老系统：没有进程回环这条路
+    _procloopback = None
 
 
 # 目标格式。16k 单声道是 ASR（paraformer / SenseVoice）的标准输入。
@@ -358,10 +381,219 @@ def write_levels(path, meter):
         pass
 
 
+RESOLVE_WAIT = 10.0     # 目标进程退出后，按名字等它回来多久（秒）
+
+
+class FeedLost(RuntimeError):
+    """这条采集路彻底废了 —— 上层据此回退另一条，绝不允许"静默无声"。"""
+
+
+def _split_blocks(block, size=SR // 50):
+    """把 100ms 的包切成 20ms 小块。
+
+    设备模式的块是 1024 帧 / 48k ≈ 21ms，Segmenter 的静音累计和预卷都是按这个粒度
+    长出来的；进程回环一个包就是 100ms，直接喂会把断句分辨率拖粗 5 倍。
+    """
+    for i in range(0, len(block), size):
+        yield block[i:i + size]
+
+
+class DeviceFeed:
+    """整机回环（pyaudiowpatch）。老路径，行为不变。"""
+
+    kind = "device"
+    lost = None
+
+    def __init__(self, audio, dev, sr, ch):
+        self._audio = audio
+        self._stream = None
+        self.channels = ch
+        self.ratio = max(1, int(round(sr / SR)))
+        self.queue = queue.Queue()
+
+    def get(self, timeout):
+        try:
+            return self.queue.get(timeout=timeout)
+        except queue.Empty:
+            return (None, None)
+
+    def close(self):
+        try:
+            self._stream.stop_stream()
+            self._stream.close()
+        except Exception:
+            pass
+        try:
+            self._audio.terminate()
+        except Exception:
+            pass
+
+
+def open_device_feed(device_name=None, why=None):
+    """打开整机回环，并 emit 一行 `device`（Node 侧靠它确认"真的开始听了"）。"""
+    p = pa.PyAudio()
+    try:
+        dev = pick_device(p, device_name)
+        sr = int(dev["defaultSampleRate"])
+        ch = int(dev["maxInputChannels"])
+        feed = DeviceFeed(p, dev, sr, ch)
+
+        # 设备原生格式打开（WASAPI 共享模式不接受别的采样率），降采样自己做。
+        #
+        # **必须用回调 + 队列，不能用阻塞 read**：静音段 loopback 一个字节都不推，
+        # `stream.read()` 会一直挂着（实测想读 4 秒、实际卡了 19 秒才返回），
+        # 主循环没有机会跑 tick，那"说完了"就永远判不出来。
+        def on_audio(in_data, frame_count, time_info, status):
+            raw = np.frombuffer(in_data, dtype=np.float32).copy()
+            feed.queue.put((time.time(), raw))
+            return (None, pa.paContinue)
+
+        feed._stream = p.open(format=pa.paFloat32, channels=ch, rate=sr, input=True,
+                              input_device_index=dev["index"], frames_per_buffer=1024,
+                              stream_callback=on_audio)
+        feed._stream.start_stream()
+        event = {"event": "device", "source": "device", "name": dev["name"],
+                 "rate": sr, "channels": ch}
+        if why:
+            event["fallback"] = why
+        emit(event)
+        return feed
+    except BaseException:
+        p.terminate()
+        raise
+
+
+class ProcessFeed:
+    """按进程抓（WASAPI process loopback）。
+
+    目标退出会**按名字重解析**（浏览器重启、播放器换实例都很常见）；等不到才置
+    `lost`，由主循环回退设备回环 —— 采集本身绝不因为目标消失而停掉。
+    """
+
+    kind = "process"
+    channels = 1
+    ratio = 1
+
+    def __init__(self, pid, name=""):
+        self.pid = int(pid)
+        self.name = name or ""
+        self.lost = None
+        self.open_error = None
+        self.queue = queue.Queue()
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="procloopback", daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def wait_ready(self, timeout=4.0):
+        """等第一包/第一个错误。True = 已经真的在抓了。"""
+        self._ready.wait(timeout)
+        return bool(self._ready.is_set() and not self.open_error)
+
+    def get(self, timeout):
+        try:
+            return self.queue.get(timeout=timeout)
+        except queue.Empty:
+            return (None, None)
+
+    def close(self):
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+
+    def _run(self):
+        current = self.pid
+        while not self._stop.is_set():
+            cap = None
+            try:
+                cap = _procloopback.ProcessLoopback(current).open()
+                if not self._ready.is_set():
+                    emit({"event": "device", "source": "process", "name": self.name,
+                          "pid": current, "rate": SR, "channels": 1})
+                    self._ready.set()
+                while not self._stop.is_set():
+                    try:
+                        blocks = cap.read(timeout=0.05)
+                    except _procloopback.TargetGone:
+                        break
+                    for block in blocks:
+                        for chunk in _split_blocks(block):
+                            self.queue.put((time.time(), chunk))
+                    if not blocks:
+                        time.sleep(0.02)
+            except Exception as exc:
+                self.open_error = f"{type(exc).__name__}: {exc}"
+                self.lost = self.lost or f"进程回环出错：{self.open_error}"
+                self._ready.set()
+                return
+            finally:
+                if cap is not None:
+                    try:
+                        cap.close()
+                    except Exception:
+                        pass
+            if self._stop.is_set():
+                return
+            if not self.name:
+                self.lost = f"目标进程 pid={current} 退出了（没有进程名，无法重解析）"
+                return
+            nxt = None
+            deadline = time.monotonic() + RESOLVE_WAIT
+            while time.monotonic() < deadline and not self._stop.is_set():
+                pids = _procloopback.find_pids(self.name)
+                if pids:
+                    nxt = pids[0]
+                    break
+                time.sleep(0.5)
+            if self._stop.is_set():
+                return
+            if nxt is None:
+                self.lost = f"目标进程 {self.name} 退出后 {RESOLVE_WAIT:.0f} 秒没再出现"
+                return
+            current = nxt
+            self.pid = nxt
+            emit({"event": "listen", "source": "process", "name": self.name,
+                  "pid": nxt, "note": "retarget"})
+
+
+def open_process_feed(pid=None, process=None):
+    """解析目标 PID 并开始抓。失败一律抛 FeedLost（带人话原因），由上层回退。"""
+    if _procloopback is None:
+        raise FeedLost("procloopback 不可用（需要 Windows 10 2004+ 与同目录模块）")
+    name = process or ""
+    target = pid
+    if target is None:
+        if name:
+            pids = _procloopback.find_pids(name)
+            if not pids:
+                raise FeedLost(f"找不到进程 {name}")
+            target = pids[0]
+        else:
+            found = _procloopback.auto_target(exclude_pids={os.getpid()})
+            if not found:
+                raise FeedLost("没有正在出声的进程（可用 --process 指定）")
+            target = found["pid"]
+            name = found["name"]
+            log(f'自动选中 {name} (pid={target}, peak={found["peak"]:.4f})')
+    feed = ProcessFeed(target, name)
+    feed.start()
+    if not feed.wait_ready(4.0):
+        feed.close()
+        raise FeedLost(feed.open_error or "等待进程回环就绪超时（4 秒）")
+    return feed
+
+
 def main():
     ap = argparse.ArgumentParser(description="抓系统回环声音，按静音断句落成 16k wav")
     ap.add_argument("--out", required=False, help="wav 输出目录（seg-<epochMs>.wav）")
     ap.add_argument("--device", default=None, help="回环设备名的一部分（默认：系统默认输出的回环）")
+    ap.add_argument("--source", choices=["auto", "device", "process"], default="auto",
+                    help="auto=先试进程回环、失败回退设备回环（默认）；device=整机回环；"
+                         "process=只抓目标进程树（Windows 10 2004+）")
+    ap.add_argument("--process", default=None,
+                    help="进程回环抓哪个进程（如 chrome.exe）；不给就自动找正在出声的那个")
+    ap.add_argument("--pid", type=int, default=None, help="进程回环直接钉死 PID（调试用）")
     ap.add_argument("--silence", type=float, default=0.35, help="静音多久算一句说完（秒）")
     ap.add_argument("--max-seg", type=float, default=3.0, help="一句话最长多少秒，超了强切")
     ap.add_argument("--pre", type=float, default=0.25, help="预卷：开口前多收多少秒")
@@ -383,29 +615,18 @@ def main():
     # 上层是 SIGTERM 收工的：不接这个信号的话 finally 不会跑，正在说的那半句就丢了
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
-    p = pa.PyAudio()
+    feed = None
+    fallback = None
+    if args.source in ("auto", "process"):
+        try:
+            feed = open_process_feed(pid=args.pid, process=args.process)
+        except FeedLost as exc:
+            fallback = str(exc)
+            log(f"进程回环没起来（{fallback}）；回退设备回环")
+    if feed is None:
+        feed = open_device_feed(args.device, why=fallback)
+
     try:
-        dev = pick_device(p, args.device)
-        sr = int(dev["defaultSampleRate"])
-        ch = int(dev["maxInputChannels"])
-        emit({"event": "device", "name": dev["name"], "rate": sr, "channels": ch})
-
-        # 设备原生格式打开（WASAPI 共享模式不接受别的采样率），降采样自己做。
-        #
-        # **必须用回调 + 队列，不能用阻塞 read**：静音段 loopback 一个字节都不推，
-        # `stream.read()` 会一直挂着（实测想读 4 秒、实际卡了 19 秒才返回），
-        # 主循环没有机会跑 tick，那"说完了"就永远判不出来。
-        q = queue.Queue()
-        ratio = max(1, int(round(sr / SR)))
-
-        def on_audio(in_data, frame_count, time_info, status):
-            raw = np.frombuffer(in_data, dtype=np.float32).copy()
-            q.put((time.time(), raw))
-            return (None, pa.paContinue)
-
-        stream = p.open(format=pa.paFloat32, channels=ch, rate=sr, input=True,
-                        input_device_index=dev["index"], frames_per_buffer=1024,
-                        stream_callback=on_audio)
         seg = Segmenter(silence=args.silence, max_seg=args.max_seg,
                         pre=args.pre, min_seg=args.min_seg, thr=args.thr,
                         live_min=(args.live_min if args.live else 0.0),
@@ -421,19 +642,29 @@ def main():
 
         def drop_ratio(x):
             nonlocal carry
+            r = feed.ratio
             cat = np.concatenate([carry, x]) if carry.size else x
-            n = len(cat) // ratio * ratio
+            n = len(cat) // r * r
             if n == 0:
                 carry = cat
                 return np.zeros(0, dtype=np.float32)
-            out = cat[:n].reshape(-1, ratio).mean(axis=1).astype(np.float32)
+            out = cat[:n].reshape(-1, r).mean(axis=1).astype(np.float32)
             carry = cat[n:]
             return out
+
+        def quiet_blocked(at_ms):
+            """这条流要不要按 quiet-until 装聋。
+
+            设备回环：要 —— 整机混音里有 TTS，不挡就是"听见自己"。
+            进程回环：**不要** —— TTS 根本不在目标进程树里，窗口挡不掉任何 AI 声音，
+            只会把窗口期间真实存在的台词按"起点落在窗口内"整段误杀（实测 128 秒零定稿）。
+            """
+            return feed.kind != "process" and tts_busy(at_ms)
 
         def land(pieces):
             nonlocal dropped, written
             for t0, audio in pieces:
-                if tts_busy(t0 * 1000):
+                if quiet_blocked(t0 * 1000):
                     dropped += 1
                     emit({"event": "skip", "reason": "tts", "at": round(t0, 3)})
                     continue
@@ -451,22 +682,27 @@ def main():
         def land_live(pieces):
             """临时快照：**同名覆盖**（一句话只有一个 live 文件），Node 侧按 size/mtime 判新。"""
             for t0, audio in pieces:
-                if tts_busy(t0 * 1000):
+                if quiet_blocked(t0 * 1000):
                     continue
                 name = f"live-{int(t0 * 1000)}.wav"
                 write_wav(os.path.join(args.out, name), audio)
                 emit({"event": "live", "at": round(t0, 3), "dur": round(len(audio) / SR, 2)})
 
-        stream.start_stream()
         while True:
-            try:
-                # 20ms 而不是 50：静音期没有数据块，`tick()` 的粒度就是这个超时 ——
-                # 它直接计进"说完 → 判定说完"的延迟里。
-                wall, raw = q.get(timeout=0.02)
-            except queue.Empty:
-                wall, raw = None, None
+            if feed.lost:
+                # 目标进程彻底没了：回退设备回环。**不许静音** —— 静音比听见自己更糟。
+                why = feed.lost
+                log(f"{why}；回退设备回环")
+                try:
+                    feed.close()
+                except Exception:
+                    pass
+                feed = open_device_feed(args.device, why=why)
+            # 20ms 而不是 50：静音期没有数据块，`tick()` 的粒度就是这个超时 ——
+            # 它直接计进"说完 → 判定说完"的延迟里。
+            wall, raw = feed.get(timeout=0.02)
             if raw is not None:
-                x = raw.reshape(-1, ch).mean(axis=1) if ch > 1 else raw
+                x = raw.reshape(-1, feed.channels).mean(axis=1) if feed.channels > 1 else raw
                 block = drop_ratio(x)
                 meter.push(wall, block)          # 音量条：顺手记，不额外解码
                 land(seg.push(wall, block))
@@ -491,10 +727,9 @@ def main():
         except Exception:
             pass
         try:
-            stream.stop_stream(); stream.close()
+            feed.close()
         except Exception:
             pass
-        p.terminate()
 
 
 if __name__ == "__main__":

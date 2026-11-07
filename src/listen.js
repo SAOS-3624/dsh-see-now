@@ -706,6 +706,8 @@ export function createListener({
   let fails = 0;
   let enabled = Boolean(injected);
   let reason = '没启动';
+  /** 声音从哪条路进来（`device` / `process`），回退时带上原因。status 里要看得见。 */
+  let backendSource = null;
   let transcriber = injected;
   let lastSegAt = 0;
   let total = 0;
@@ -732,6 +734,8 @@ export function createListener({
       enabled,
       reason,
       backend: transcriber?.label ?? null,
+      /** 采集来源：`device`（整机回环）/ `process`（按进程）。没起来就是 null。 */
+      source: backendSource,
       python: python ?? null,
       dir: audioDir,
       lines: buffer.size,
@@ -1000,6 +1004,8 @@ export function createListener({
       // 断句与快照参数全部透传给 Python —— 它们是"什么时候切一段"的唯一决定者
       child = spawn(python, [
         script, '--out', audioDir,
+        '--source', String(cfg.source ?? 'auto'),
+        ...(cfg.targetProcess ? ['--process', String(cfg.targetProcess)] : []),
         '--silence', String(cfg.silence),
         '--max-seg', String(cfg.maxSeg),
         ...(cfg.live ? ['--live-min', String(cfg.liveMin), '--live-step', String(cfg.liveStep)] : ['--live', '0']),
@@ -1038,7 +1044,15 @@ export function createListener({
     const ok = await new Promise((resolve) => {
       const t = setTimeout(() => resolve(null), 4000);
       const onData = (d) => {
-        if (!String(d).includes('"event": "device"')) return;
+        const text = String(d);
+        if (!text.includes('"event": "device"')) return;
+        // 这一行同时回答"从哪条路进来的"：设备回环 / 进程回环（失败时带 fallback 原因）
+        try {
+          const ev = JSON.parse(text.trim().split('\n').pop());
+          backendSource = ev.source === 'process'
+            ? `进程回环：${ev.name || ev.pid}`
+            : (ev.fallback ? `设备回环（进程回环没起来：${ev.fallback}）` : '设备回环');
+        } catch { /* 解析不了就保持 null，不影响可用性 */ }
         clearTimeout(t);
         child?.stdout?.off('data', onData);
         resolve(true);
@@ -1053,7 +1067,7 @@ export function createListener({
     }
 
     enabled = true;
-    reason = '在听';
+    reason = backendSource ? `在听（${backendSource}）` : '在听';
     timer = setInterval(() => {
       // 这里**不能静默吞**：drain 里的意外（权限、编码、表单构造）如果被 `.catch(() => {})`
       // 吃掉，表现就是"在听、但永远没台词"，日志里一条线索都没有。
@@ -1070,6 +1084,7 @@ export function createListener({
       child = null;
     }
     enabled = false;
+    backendSource = null;
     reason = why || '停了';
   }
 
