@@ -205,7 +205,9 @@ HEARTBEAT_EVERY = 1.0
 
 def read_config() -> dict:
     try:
-        return json.loads(CONFIG.read_text(encoding="utf-8")) or {}
+        # utf-8-sig：记事本/老编辑器会在开头留 BOM；按 utf-8 读会直接抛异常，
+        # 被 except 吞成 {}，所有设置静默退回默认（窗口位置、弹幕、glass 一起丢）。
+        return json.loads(CONFIG.read_text(encoding="utf-8-sig")) or {}
     except Exception:
         return {}
 
@@ -423,7 +425,12 @@ def danmaku_options(cfg=None) -> dict:
         font_size = int(cfg.get("danmakuFontSize"))
     except (TypeError, ValueError):
         font_size = None
+    try:
+        inset = int(cfg.get("danmakuInset") or 0)
+    except (TypeError, ValueError):
+        inset = 0
     return {"edge": edge if edge in DANMAKU_EDGES else "top",
+            "inset": max(0, min(600, inset)),
             "lanes": max(1, min(3, lanes)),
             "speed": max(40, min(400, speed)),
             "font_family": str(cfg.get("danmakuFont") or "").strip() or None,
@@ -760,7 +767,8 @@ class LiveGlass:
         w, h = DEFAULT_W, DEFAULT_H
         # 默认位置仍是主屏居中偏右下（和以前一致）；恢复位置按虚拟桌面钳位，
         # 否则上次存在第二块屏上的坐标（负数）会被拉回主屏左上角。
-        x, y = max(40, sw - w - 80), max(40, (sh - h) // 2 - 40)
+        # 默认右下角：竖着居中正好压在播放器和画面弹幕上（issue #61 第 2 条）。
+        x, y = max(40, sw - w - 80), max(40, sh - h - 80)
         try:
             size, rest = geo.split("+", 1)
             pw, ph = (int(v) for v in size.split("x"))
@@ -829,8 +837,12 @@ class LiveGlass:
         if not isinstance(event, dict):
             return
         if event.get("type") in ("message", "meta"):
-            self.feed.add(ChatFeed.parse(json.dumps(event, ensure_ascii=False)))
-            self._refresh_feed()
+            msg = ChatFeed.parse(json.dumps(event, ensure_ascii=False))
+            if self.feed.add(msg):
+                self._refresh_feed()
+                # 协议路径也要推弹幕；开场回放的历史不推（见 _replay_protocol）。
+                if not getattr(self, "_replaying", False):
+                    self._push_danmaku([msg])
         elif event.get("type") == "control":
             self._apply_control(event)
 
@@ -870,11 +882,15 @@ class LiveGlass:
     def _replay_protocol(self) -> None:
         if self._protocol is None:
             return
+        # 回放历史时置位：`_render_event` 只填聊天框，不把旧消息一次性推成弹幕雨。
+        self._replaying = True
         try:
             for event in self._protocol.reset_events(60):
                 self._render_event(event)
         except Exception:
             pass
+        finally:
+            self._replaying = False
 
     # ---- 聊天轮询 ----
 
@@ -1357,14 +1373,25 @@ class LiveGlass:
             self._danmaku.close()
             self._danmaku = None
 
-    def _push_danmaku(self) -> None:
-        """把本轮新增的消息推进弹幕队列。用户自己说的话不飘。"""
+    def _push_danmaku(self, messages=None) -> None:
+        """把**本轮新增**的消息推进弹幕队列。用户自己说的话不飘。
+
+        `messages` 给了就只推这几条（协议路径用）；没给才用 `feed.poll()` 的
+        增量 `recent`。meta 和超过 5 秒的迟到历史都跳过，避免回放/状态行刷屏。
+        """
         if self._danmaku is None:
             return
-        for msg in getattr(self.feed, "recent", ()):
+        now_ms = int(time.time() * 1000)
+        for msg in (messages if messages is not None else getattr(self.feed, "recent", ())):
+            role = msg.get("role") or "assistant"
+            if role == "meta":
+                continue
+            at = msg.get("at")
+            if isinstance(at, (int, float)) and at > 0 and now_ms - at > 5000:
+                continue
             text = msg.get("text") or ""
             if text:
-                self._danmaku.push(text, msg.get("role") or "assistant")
+                self._danmaku.push(text, role)
 
     def _unread(self) -> int:
         return sum(1 for m in self.feed.messages
