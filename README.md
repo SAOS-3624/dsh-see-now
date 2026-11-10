@@ -499,6 +499,7 @@ see_now({ scene: true, say: "好，接下来每换一个画面我就说一句" }
   "maxAutonomousWakes": 24,
   "idleStopMin": 10,
   "defaultPace": "calm",
+  "fps": 12,
   "speechPacing": true
 }
 ```
@@ -508,6 +509,8 @@ see_now({ scene: true, say: "好，接下来每换一个画面我就说一句" }
 | `maxAutonomousWakes` | 8 | 连续这么多次自动叫醒都没人理 → 收工。**悬浮窗开着时，这条就是实际的最长陪看时长**（normal 15 秒一次 ≈ 2 分钟）。1–200 |
 | `idleStopMin` | 3 | 没开悬浮窗时，用户这么久没说话 → 收工。`0` = 关掉这条 |
 | `defaultPace` | `normal` | 新会话/重开采集时的默认节奏：`calm` / `normal` / `dense` / `game-economic`。调用里显式传 `pace` 仍然优先 |
+| `fps` | 12 | 采集**与打分共用**的帧率。采集侧定时抽帧、`pipeline` 算"秒 ↔ 帧"都用它，两个数不一致会让积分阈值和密度窗整体偏 |
+| `timeNormalizeFrames` | `true` | 把三处**按帧**的内部窗口（`smoothFrames` 6 / `BAR_WINDOW` 24 / `cutBgWindow` 6）按 `帧数/12×fps` 折算成等效帧数，保住秒数。`fps: 12` 时折算系数正好 1，行为逐位不变；关掉 = 0.1.x 老口径 |
 | `speechPacing` | `true` | 按上一句的估计时长排下一轮（中文约 5 字/秒）。`"guard"` = 只在长句时推迟、不比旧节奏密；`false` = 退回固定间隔 |
 | `changeLog` | `false` | 交付时在图下面附一段「这期间屏幕怎么动的」（每张图一行：时刻 / 变化分 / 方位 / 占屏）。`queueDepth` 挤掉的画面只有这里能看到。每次交付约 +100 token，默认关 |
 | `tierMode` | `density` | 格子大小按什么算：`density` 看过去 1 秒平均每秒几帧；`weight` 按每帧变化分切面积（同图内会出现大小对比，省 28~45% token，但一张图覆盖的时长变长、出图变慢） |
@@ -515,6 +518,15 @@ see_now({ scene: true, say: "好，接下来每换一个画面我就说一句" }
 | `tierThresholds` | `[0.26,0.6,0.9,1.2,1.8,2.4,3.0]` | `tierCurve:"custom"` 时生效：7 个**帧/秒**的数，**必须严格递增**（不递增会整份退回默认 —— 滞回带互相盖住会让档位卡死） |
 | `tierStyle` | `standard` | 映射：`standard`（1 档压成 1/2）/ `native` 原样 / `full` 整体降一档 / `compact` 升一档 / `custom` 走 `tierMap` |
 | `tierMap` | `[1,2,3,4,5,6,7,8]` | `tierStyle:"custom"` 时生效：第 i 个数 = "档位 i+1 映射到哪一档" |
+
+**为什么值得单独说 `fps`**：这套阈值里**只有三处是按帧写的**（`smoothFrames` / `BAR_WINDOW` /
+`cutBgWindow`），其余全是秒或分数 —— 因为本仓一直固定 12fps，帧数恰好等于时间，写死也没人发现。
+改采集帧率（比如降到 8 省 CPU、升到 15 更跟手）之后，那三处窗口的**秒数**就变了：
+15fps 下平滑只剩 0.4 秒、黑边窗 1.6 秒。`timeNormalizeFrames` 就是补这个的，
+**切点判定完全不受影响**（`cutAbs` 是分数、`cutMinGap` 是秒、积分是 `4×fps×3` 用 fps 换算）。
+
+实测：同一段素材抽成 12fps（519 帧）和 15fps（649 帧）两批，`cut` 都是 **48** 个；
+归一化打开时两边都出 **10 张**图，关掉则 15fps 变成 **12 张**（窗口变短 → 封箱更频繁）。
 
 **为什么要 `changeLog`**：出图队列只留最新一张（"宁可丢老画面，不给模型看十几秒前的事"）。
 这在陪看视频时是对的，但**配合操作电脑时不够** —— 模型点完一下、或者上一轮思考的十几秒里

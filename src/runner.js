@@ -231,6 +231,13 @@ export function createRunner({
    */
   wakeBatch = 1,
   /**
+   * 采集帧率（`~/.dsh/see-now.json` 的 `fps`，默认 12）。
+   *
+   * **采集和打分必须用同一个数**：`createPipeline` 拿它算"秒 ↔ 帧"，
+   * `captureArgs` 拿它定时抽帧。两个数不一致，积分阈值和密度窗就整体偏。
+   */
+  fps = 12,
+  /**
    * 全局档位映射（`~/.dsh/see-now.json` 的 `tierStyle` / `tierMap`）。
    *
    * 只在**调用方没显式传** `opts.strategy` 时生效 —— 逐帧模式（`SCENE_OPTS`）必须
@@ -641,7 +648,7 @@ export function createRunner({
     } : {};
     // oneShot 由调用方（watch）决定：**只有换清晰度**时置 true（缓冲区刚扔，等攒满等于白等一个窗口）
     const p = createPipeline({
-      ...opts, width: w, height: h, ...regionOpts,
+      ...opts, width: w, height: h, fps: opts.fps ?? fps, ...regionOpts,
       // 变化日志是会话级偏好（配置项），不该被单次 watch 的 opts 覆盖
       changeLog,
       /**

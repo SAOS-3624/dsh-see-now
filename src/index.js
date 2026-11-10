@@ -615,6 +615,8 @@ async function registerAll(ctx) {
     changeLog: tuning.changeLog,
     // 超省模式：攒够几张图才交（`wakeBatch`，默认 1 = 现在这样）
     wakeBatch: tuning.wakeBatch,
+    // 采集帧率（`fps`，默认 12）。采集与打分共用这一个值
+    fps: tuning.fps,
     // 档位映射：这张图里每帧占多大格子（设置页「高级」里那项）
     tierStyle: tuning.tierStyle,
     tierMap: tuning.tierMap,

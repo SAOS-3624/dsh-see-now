@@ -26,6 +26,24 @@ export const TUNING_DEFAULTS = Object.freeze({
   idleStopMin: 3,
   defaultPace: 'normal',
   /**
+   * 采集与打分的**帧率**（默认 12）。
+   *
+   * 采集侧（`capture.js`）和 `pipeline.js` 用的是**同一个值**（`runner` 里
+   * `fps: p.constants.fps` 传下去），所以两者不会漂。
+   *
+   * 它只影响两件事：① 采集多久出一帧；② `pipeline` 里"秒 ↔ 帧"的换算比例
+   * （积分阈值 `4×fps×3`、密度窗 `dtFrames/fps`）。**阈值本身全是秒/分数**，
+   * 所以改帧率不会让切点判定变松变紧。
+   *
+   * ⚠️ 唯一按**帧数**写的是三处内部窗口（`smoothFrames` 6 / `BAR_WINDOW` 24 /
+   * `cutBgWindow` 6），它们由 `timeNormalizeFrames` 按 `帧数/12×fps` 折算，
+   * 秒数恒定。默认开，且 `fps: 12` 时折算系数正好 1，行为逐位不变。
+   *
+   * 手机上同一台机请求 12 可能落到 15（AE 只给固定档），所以 App 那边取的是
+   * **实测值**而不是这里的请求值。
+   */
+  fps: 12,
+  /**
    * 超省模式：攒够几张图才交给模型（1 = 现在这样，攒满一张就交）。
    *
    * 省的不是图的钱 —— 一张 798×450 只有 222 token，多带两张几乎不要钱。

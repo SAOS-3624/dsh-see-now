@@ -131,11 +131,15 @@ export const BAR_MAX = 24;
 /** 黑边占比上限：超过它多半是"整段黑场"，不做补偿。 */
 export const BAR_CAP = 0.35;
 /**
- * 黑边窗口（帧）。12fps 下 24 帧 = 2 秒。
+ * 黑边窗口（帧，**按 12fps 定的基准** = 2 秒）。
  *
  * **必须累积**：判据是"一直黑"而不是"这一帧黑"。片头/转场黑场每一行都黑，
  * 但它随后亮了 —— 只看当前帧就会把整幅画面当成黑边，分数除以 0.65 白白放大 1.5 倍。
  * 窗口也不宜太长：换到夜景后的前 2 秒补偿会消失（偏保守，宁可少放大）。
+ *
+ * ⚠️ 这是**帧数**，不是秒数。固定 12fps 时两者等价，改采集帧率就不等价了 ——
+ * 所以 `createScorer` 收一个 `barWindow` 参数，由 `pipeline.js` 按 fps 折算
+ * （`timeNormalizeFrames`，关掉就是原样 24 帧，与老行为一致）。
  */
 export const BAR_WINDOW = 24;
 
@@ -441,6 +445,7 @@ export function createScorer({
   width, height, scoreMode = 'abs', mcTau = 15, mcRadius = 2, gateMcRadius = mcRadius,
   bgWindow = 6, bgStableRange = 24, bgTau = 15, bgModel = false,
   bgRefWindow = 0, futureMinScore = Infinity, scoreNormalize = false,
+  barWindow = BAR_WINDOW,
 }) {
   const n = SCAN_W * SCAN_H;
   const rgb = new Float32Array(n * 3);
@@ -455,8 +460,10 @@ export function createScorer({
    */
   const normalize = scoreNormalize && scoreMode !== 'mc';
   /** 黑边滚动窗：存每帧的逐行 V 累加/峰值，判"一直黑"（见 barFraction）。 */
-  const rowV = Array.from({ length: BAR_WINDOW }, () => new Float32Array(SCAN_H));
-  const rowVMax = Array.from({ length: BAR_WINDOW }, () => new Float32Array(SCAN_H));
+  // 帧数由调用方按 fps 折算（见 BAR_WINDOW 的注释）；不传就是老口径 24 帧
+  const barWin = Math.max(1, Math.trunc(barWindow) || BAR_WINDOW);
+  const rowV = Array.from({ length: barWin }, () => new Float32Array(SCAN_H));
+  const rowVMax = Array.from({ length: barWin }, () => new Float32Array(SCAN_H));
   const barV = new Float32Array(SCAN_H);
   const barVMax = new Float32Array(SCAN_H);
   let barSlot = 0;
@@ -478,8 +485,8 @@ export function createScorer({
       sums[y] = sum;
       maxes[y] = mx;
     }
-    barSlot = (barSlot + 1) % BAR_WINDOW;
-    if (barFrames < BAR_WINDOW) barFrames += 1;
+    barSlot = (barSlot + 1) % barWin;
+    if (barFrames < barWin) barFrames += 1;
     // 窗口内逐行求和/取峰值。24 帧 × 36 行 × 2 = 1728 次浮点运算，12fps 下可忽略。
     for (let y = 0; y < SCAN_H; y += 1) {
       let sum = 0;

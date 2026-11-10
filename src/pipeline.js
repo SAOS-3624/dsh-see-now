@@ -17,7 +17,7 @@
  *    只数切点会让档位永远 1 档、一张图只放 4 帧。见 tiers.js 的推导。
  */
 
-import { SCAN_H, SCAN_W, bgBorderChanged, bgKeep, createScorer, scorePair } from './cuts.js';
+import { BAR_WINDOW, SCAN_H, SCAN_W, bgBorderChanged, bgKeep, createScorer, scorePair } from './cuts.js';
 import { createTiers, applyStrategy } from './tiers.js';
 import { packTiers, toRects, splitOneBin } from './pack.js';
 import { composePacked, drawAudioStrip, stripHeight } from './sheet.js';
@@ -30,6 +30,23 @@ export const DEFAULTS = Object.freeze({
   width: 798,
   height: 450,
   fps: 12,
+  /**
+   * 把"按帧的窗口"折算成"按秒"（保持秒数不随 fps 变）。
+   *
+   * 阈值（切点/积分/兜底/档位密度）本来就全是秒，帧率无关；但有三处内部窗口是
+   * 按**帧数**写的 —— 因为本仓一直固定 12fps，帧数 = 时间，写死也没人发现：
+   *
+   * | 参数 | 默认 | 12fps 下 |
+   * |---|---|---|
+   * | `smoothFrames` | 6 帧 | 0.5 秒 |
+   * | `BAR_WINDOW` | 24 帧 | 2 秒 |
+   * | `cutBgWindow` | 6 帧 | 0.5 秒 |
+   *
+   * 一旦 `fps` 不是 12（手机端是 8/15/30 档位），照抄就是"窗口时长随帧率变"：
+   * 15fps 下平滑只剩 0.4 秒、黑边窗 1.6 秒。打开这个开关按 `帧数/12×fps` 折算，
+   * **秒数恒定**。默认 `true`，但 `fps: 12` 时折算系数正好 1，行为逐位不变。
+   */
+  timeNormalizeFrames: true,
 
   /**
    * 切点：绝对值门槛 + 尖峰比 + 不应期。
@@ -376,19 +393,31 @@ export function createPipeline(opts = {}) {
    */
   const regionAspect = o.region ? o.region.w / o.region.h : null;
 
+  /**
+   * 按帧数定的窗口 → 当前 fps 下的等效帧数（保持秒数不变）。
+   * `timeNormalizeFrames: false` 时原样返回（= 0.1.x 的老口径）。
+   */
+  const BASE_FPS = 12;
+  const normFrames = (frames) => {
+    if (!o.timeNormalizeFrames || !(frames > 0)) return frames;
+    return Math.max(1, Math.round((frames / BASE_FPS) * fps));
+  };
+
   const scorer = createScorer({
     width, height, scoreMode: o.scoreMode, mcTau: o.mcTau, mcRadius: o.mcRadius,
-    gateMcRadius: o.cutMcRadius, bgWindow: o.cutBgWindow, bgModel: o.cutFutureDelay > 0,
-    bgRefWindow: o.cutFutureDelay > 0 ? o.cutFutureRefWindow : 0,
+    gateMcRadius: o.cutMcRadius, bgWindow: normFrames(o.cutBgWindow), bgModel: o.cutFutureDelay > 0,
+    bgRefWindow: o.cutFutureDelay > 0 ? normFrames(o.cutFutureRefWindow) : 0,
     scoreNormalize: o.scoreNormalize,
     futureMinScore: o.cutFutureDelay > 0
       ? Math.min(o.cutFutureMinScore, o.cutFutureBuildMinScore)
       : o.cutFutureMinScore,
+    barWindow: normFrames(BAR_WINDOW),
   });
   const tiers = createTiers({
     fps,
-    dtFrames: o.dtFrames,
-    smoothFrames: o.smoothFrames,
+    // 卷积窗也是**帧数**：12 帧在 8fps 下是 1.5 秒、30fps 下是 0.4 秒，同样要折算
+    dtFrames: normFrames(o.dtFrames),
+    smoothFrames: normFrames(o.smoothFrames),
     curve: o.tierCurve,
     thresholds: Array.isArray(o.tierThresholds) && o.tierThresholds.length === 7
       ? o.tierThresholds.map(Number)
@@ -487,7 +516,21 @@ export function createPipeline(opts = {}) {
    * 比它静就永远累不够 —— 这才是"运动多给几帧"，而不是固定 N 秒一帧。
    */
   function integralNeed() {
-    return REF_SCORE * fps * o.integralSeconds;
+    /**
+     * **用基准帧率，不用实际 fps**（2026-11-10 修）。
+     *
+     * 这个阈值的意思是"这几秒里画面一共变了多少"—— `acc` 累的是每帧的
+     * `scorePair`，而那是**绝对差**：帧间隔越短差越小，所以 Σscore 只与**时间**
+     * 有关。实测同一段 40 秒素材，8/12/15/24/30fps 的 scoreSum 分别是
+     * 5093 / 5092 / 5090 / 5090 / 5090 —— 差 0.06%。
+     *
+     * 旧写法 `REF_SCORE * fps * 3` 却随 fps 线性涨（96 → 144 → 180 → 288 → 360），
+     * 于是高帧率永远攒不够：实测 marks 在 8fps 有 8 个、24/30fps 是 **0 个**。
+     *
+     * 改成常数后五档都是 144（= 12fps 标定值），marks 变成 3/3/5/5/5。
+     * **12fps 下逐位不变**（144 = 144）。
+     */
+    return REF_SCORE * BASE_FPS * o.integralSeconds;
   }
 
   function keep(entry, via) {
