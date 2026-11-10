@@ -105,6 +105,10 @@ export const inject = ['tools', 'attachments', 'sessionController'];
  * 「刚交出去图」的回调。`attachAndReturn` 是模块级函数，够不到 apply 作用域里的
  * `tuning` / `lastSessionId`，所以走这条钩子：apply 时挂上，交付后触发自动省略。
  * 用钩子而不是把 `attachAndReturn` 改成闭包 —— 它被测试和其他分支到处调用。
+ *
+ * 参数是**图交到了哪个会话**（`watch` 是开始等待前锁定的 owner，`peek` 是这次调用的会话）。不能让钩子自己
+ * 现取 `lastCallerSessionId`：`watch` 要阻塞 15–40 秒，这期间别的会话调一次 see_now
+ * 就会把它改掉，省略就打到别人的历史上去了。
  */
 let afterDelivery = null;
 
@@ -406,8 +410,11 @@ function sheetText(sheet, { waited = 0, partial = false, userText = null, say = 
  * `meta` 里单张的字段（`frames` / `from` / `to` / `fill` / `why` / `bytes`）保持不变，
  * 单张时语义完全一样；多张时 `frames` / `bytes` 是合计，`from` / `to` 是首尾，
  * 逐张的区间放进 `sheets[]`。`batch` 说明这次交了几张。
+ *
+ * `sessionId` 是这批图交给的会话，只用来告诉自动省略该看哪一份历史；
+ * 不放进 `extra` —— `extra` 会原样进 `meta`。
  */
-async function attachAndReturn(ctx, sheets, extra = {}) {
+async function attachAndReturn(ctx, sheets, extra = {}, { sessionId = null } = {}) {
   const svc = serviceOf(ctx, 'attachments');
   const list = (Array.isArray(sheets) ? sheets : [sheets]).filter(Boolean);
   if (!list.length) {
@@ -427,7 +434,7 @@ async function attachAndReturn(ctx, sheets, extra = {}) {
   // `say` 是给清单用的，不进 meta —— 那是整段话，塞进 meta 只会让返回值翻倍
   const { say: said, ...meta } = extra;
   // 图已经交给宿主了，顺手看要不要省略老的（异步、不阻塞、失败只记日志）
-  try { afterDelivery?.(); } catch { /* 省略绝不能影响这一张图的交付 */ }
+  try { afterDelivery?.(sessionId); } catch { /* 省略绝不能影响这一张图的交付 */ }
   const first = list[0];
   const last = list[list.length - 1];
   return {
@@ -668,11 +675,14 @@ async function registerAll(ctx) {
    * 判成 ATTACHMENT_CORRUPT（那比删掉更糟：删掉至少能看出是"文件没了"）。
    * 事件一落地，投影就把那些图换成占位文本，之后既不发出去、也能从磁盘删。
    *
-   * @param {number} keep - 保留最近几张不省略
-   * @param {{silent?: boolean}} [opts] - 自动触发时静默：出错只记日志，不打扰模型
+   * @param {{trigger?: number, keep?: number}} [limits] - `trigger`：历史里超过几张才省略（0 = 关）；
+   *   `keep`：保留最近几张不省略。缺省或不合法时用 `tuning.imageTrigger` / `tuning.imageKeep`
+   * @param {{silent?: boolean, sessionId?: string|null}} [opts] - `silent`：自动触发时静默，出错只记日志，不打扰模型；
+   *   `sessionId`：要省略的会话（调用方知道图交给了谁时必须传），不传时依次退到
+   *   `lastCallerSessionId`、`lastSessionId`
    * @returns {Promise<{ok:boolean, text:string, meta:object}>}
    */
-  async function runOffload(limits, { silent = false } = {}) {
+  async function runOffload(limits, { silent = false, sessionId = null } = {}) {
     const trigger = Number.isFinite(limits?.trigger) && limits.trigger >= 0 ? Math.floor(limits.trigger) : tuning.imageTrigger;
     const keep = Number.isFinite(limits?.keep) && limits.keep >= 0 ? Math.floor(limits.keep) : tuning.imageKeep;
     if (trigger === 0) {
@@ -690,9 +700,11 @@ async function registerAll(ctx) {
     if (!sc?.resolveAgent) {
       return { ok: false, text: '宿主没有 sessionController，没法写会话事件。', meta: { ok: false, offload: { reason: 'no-session-controller' } } };
     }
-    // 省略是**会话级**动作：优先用"这一次调用的会话"，`lastSessionId` 只兜底。
-    // 以前只认 `lastSessionId`，多开时会把图从**别的会话**的历史里省掉。
-    const sid = lastCallerSessionId ?? lastSessionId;
+    // 省略是**会话级**动作：优先用调用方传进来的会话（图交给了谁），
+    // 其次是"最近一次调用的会话"，`lastSessionId` 只兜底。
+    // 以前只认 `lastSessionId`，多开时会把图从**别的会话**的历史里省掉；
+    // 只认 `lastCallerSessionId` 也不够 —— `watch` 阻塞期间别的会话一调就把它改了。
+    const sid = sessionId ?? lastCallerSessionId ?? lastSessionId;
     if (!sid) {
       return { ok: false, text: '还不知道是哪个会话（这个进程还没收到过 session/event）。先 `watch` 一次再来。', meta: { ok: false, offload: { reason: 'no-session' } } };
     }
@@ -753,15 +765,25 @@ async function registerAll(ctx) {
    * **节流 30 秒** —— 重放整份会话日志是要花钱的（一次几十毫秒到几百毫秒），
    * 不能每交一张图就跑。出图间隔本身是 15–40 秒，所以实际是"差不多每次出图检查一次"。
    * 用 `setTimeout(0)` 甩出去，**绝不拖慢交付**：模型拿到图的时间不能受这个影响。
+   *
+   * **节流按会话记**：只有一个全局时间戳的话，A 刚交完图，30 秒内 B 交的图就不检查了。
+   * 会话 id 在这里**同步**定下来，不留到 `setTimeout` 里现取。
+   * 写新时间戳时顺手清掉过了节流窗口的条目 —— 它们已经挡不住任何检查，
+   * 留着只会让这张表跟着见过的会话数一直长（进程常驻，会话来来去去）。
    */
-  let lastOffloadCheck = 0;
-  function maybeAutoOffload() {
+  const OFFLOAD_THROTTLE_MS = 30_000;
+  const lastOffloadCheck = new Map();
+  function maybeAutoOffload(sessionId = null) {
     if (!tuning.imageTrigger) return;
+    const sid = sessionId ?? lastCallerSessionId ?? lastSessionId;
     const now = Date.now();
-    if (now - lastOffloadCheck < 30_000) return;
-    lastOffloadCheck = now;
+    if (now - (lastOffloadCheck.get(sid) ?? 0) < OFFLOAD_THROTTLE_MS) return;
+    for (const [k, at] of lastOffloadCheck) {
+      if (now - at >= OFFLOAD_THROTTLE_MS) lastOffloadCheck.delete(k);
+    }
+    lastOffloadCheck.set(sid, now);
     setTimeout(() => {
-      void runOffload({ trigger: tuning.imageTrigger, keep: tuning.imageKeep }, { silent: true });
+      void runOffload({ trigger: tuning.imageTrigger, keep: tuning.imageKeep }, { silent: true, sessionId: sid });
     }, 0);
   }
   afterDelivery = maybeAutoOffload;
@@ -1243,7 +1265,7 @@ async function registerAll(ctx) {
           say: said,
           looping: Boolean(lp) && !lp.stopped(),
           loopWakes: lp ? lp.state().wakes : 0,
-        });
+        }, { sessionId: ownerAtStart });
         /**
          * **窗被藏起来时必须当面说清**，否则就是"你说'眼睛开上了'，屏幕上什么都没有"。
          * 只在藏着的时候加这一句（正常情况不加噪音），并给出唯一能用的那条指令。
@@ -1293,7 +1315,7 @@ async function registerAll(ctx) {
             meta: { ok: false, reason: 'no-sheet', loop: lp?.state() ?? null },
           };
         }
-        return await attachAndReturn(ctx, s, { looping: Boolean(lp) && !lp.stopped() });
+        return await attachAndReturn(ctx, s, { looping: Boolean(lp) && !lp.stopped() }, { sessionId: callerSessionOf(run) });
       }
 
       if (action === 'pause' || action === 'resume' || action === 'seek' || action === 'configure') {
@@ -1461,7 +1483,7 @@ async function registerAll(ctx) {
         const askedKeep = args.keep === undefined ? tuning.imageKeep : Number(args.keep);
         const trigger = Number.isFinite(askedTrigger) && askedTrigger >= 0 ? Math.floor(askedTrigger) : tuning.imageTrigger;
         const keep = Number.isFinite(askedKeep) && askedKeep >= 0 ? Math.floor(askedKeep) : tuning.imageKeep;
-        const r = await runOffload({ trigger, keep });
+        const r = await runOffload({ trigger, keep }, { sessionId: callerSessionOf(run) });
         return { text: r.text, meta: r.meta };
       }
 
