@@ -2,6 +2,40 @@
 
 ## [Unreleased]
 
+### Fixed — 自动省略可能省到**别的会话**头上，节流是全局的（PR #65）
+
+`attachAndReturn()` 交完图调自动省略时不带会话，`maybeAutoOffload()` 又用
+`setTimeout(0)` 甩出去，等真跑起来才读 `lastCallerSessionId` —— 而这个值在
+`execute()` 开头被**任何一次** see_now 调用改写。`watch` 锁定 owner 之后要阻塞
+15–40 秒，这期间另一个会话调一次 `status` / `help` / `peek`，交付后的省略就去
+重放**那个**会话的日志：那边超线时省掉的是别人的老图，真正在涨图的会话反而没省。
+
+- 交付时同步定下会话（`watch` 用开始等待前锁定的 owner，`peek` 用这次调用的会话），
+  一直传到 `runOffload`；拿不到会话的老宿主 / 子会话行为不变；
+- 30 秒节流从**一个全局时间戳**改成**按会话记** —— 以前 A 刚检查过，B 交的图 30 秒内
+  就不检查了；写新时间戳时顺手清过期条目，表不会跟着见过的会话数一直长。
+
+### Fixed — `source:"file"` 的 path 能拼出协议 URL，`-i undefined`（PR #66）
+
+`path` 是模型能填的参数，`srcOf()` 原样收下、`sourceArgs()` 原样拼进 `ffmpeg -i`：
+填 `http://…` / `tcp://…` / `concat:…` 时 ffmpeg 真的会去连（那是协议前缀）。
+
+- 入口只收**本机文件的绝对路径**：绝对、存在、普通文件，否则报一句能照做的话、
+  不起采集（`meta.reason` 从写死的 `bad-region` 改成 `bad-path`）；
+- Windows 上两个分隔符开头的一律在 `stat` 之前拒（UNC / `\\?\` / `\\.\`）——
+  光 stat 一个 UNC 路径就已经在连网络了；映射成盘符的网络盘不受影响；
+- 文件源的 ffmpeg 参数加 `-protocol_whitelist file` 兜底（直接调 `runner` / `spawnFrames`
+  的调试脚本也走这里）；
+- **兼容变化**：相对路径以前「碰巧能用」（按宿主 cwd 解析，结果不可预期），现在会明确被拒。
+
+### Fixed — 弹幕开了不飘：窗口只从 `chat.jsonl` 轮询推弹幕（上游 #61 / PR #62，随 `sync:window` 下来）
+
+消息 0.2 之后走 `window-events.jsonl`，`_render_event()` 那条路径只上聊天框，
+弹幕唯一的推送入口挂在老的轮询上 —— 协议文件存在时 `chat.jsonl` 基本不再产生新行，
+于是弹幕整体失效。同步下来的 `window.py` 里：协议消息 `add()` 成功后直接推、
+开场回放不推、`meta` 和迟到 5 秒以上的历史不推；顺带 `utf-8-sig` 读配置（BOM 不再
+把整份配置吞成 `{}`）、`danmakuInset` 生效、默认位置从竖着居中改到右下角。
+
 ### Fixed — Linux 抓屏在 798 / 1050 这类宽度下画面是「斜切」的
 
 GStreamer 的 RGB 行按 **4 字节对齐**：`width*3` 不是 4 的倍数时，每行尾部会多出 padding。
