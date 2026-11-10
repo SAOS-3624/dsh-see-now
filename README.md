@@ -711,6 +711,18 @@ test/                     181 条测试
 
 ---
 
+## 下游项目
+
+- **[dsh-see-now-more](https://github.com/nacivageer/dsh-see-now-more)** —— 基于本项目的本地增强分支：
+  常驻悬浮窗（IM 式聊天 / 历史 / 收藏 / 送达回执）、回合中插话、系统声音字幕、逐场景模式。
+  屏幕采样与拼图那部分仍是这里的代码，按 Apache-2.0 保留 LICENSE / NOTICE，README 标了上游。
+  不是本仓库维护的，问题请提到它自己的 issue。
+
+想把衍生项目挂在这里，开个 issue 说一声就行 —— 不要求改代码，也不要求征得同意（Apache-2.0 本来就允许），
+只是别让人以为它是官方版本。
+
+---
+
 ## 协议
 
 **Apache License 2.0** —— 商用、闭源、再分发、改完再卖都可以，保留 [LICENSE](./LICENSE) 与
