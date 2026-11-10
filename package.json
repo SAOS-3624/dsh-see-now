@@ -1,6 +1,6 @@
 {
   "name": "dsh-see-now",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Let DSH watch a live screen or camera feed: score every frame by how much the picture changed, keep only the ones that matter, and pack them into one image. · 让 AI 实时看见你的屏幕，只传「画面变了」的那几帧。",
   "keywords": [
     "dsh",

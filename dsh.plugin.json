@@ -1,7 +1,7 @@
 {
   "name": "dsh-see-now",
   "description": "Let DSH watch a live screen or camera feed: score frames by how much the picture changes, pack the important ones into a 4x4 sheet, and push it into the session.",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "entry": {
     "name": "dsh-see-now",
     "inject": [
