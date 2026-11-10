@@ -16,7 +16,7 @@ import { execFileSync } from 'node:child_process';
 import { FFMPEG, ffmpegOk } from './ffmpeg.mjs';
 import { existsSync, mkdirSync, mkdtempSync, statSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 const home = mkdtempSync(join(tmpdir(), 'dsh-see-caller-'));
 process.env.DSH_HOME = home;
@@ -26,7 +26,8 @@ const TOOLS_PATH = process.env.DSH_TOOLS_PATH
   ?? join(homedir(), '.dsh', 'profiles', 'node_modules', '@deepseek-ai', 'dsh-tools', 'lib', 'index.js');
 process.env.DSH_TOOLS_PATH = TOOLS_PATH;
 
-const FIXTURE = join('.tmp', 'caller-clip.mp4');
+// 绝对路径：工具入口只收本机文件的绝对路径
+const FIXTURE = resolve('.tmp', 'caller-clip.mp4');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function makeFixture() {

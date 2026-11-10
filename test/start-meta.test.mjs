@@ -16,7 +16,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, statSync } from 'node:fs';
 import { mkdtempSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 import { FFMPEG, ffmpegOk } from './ffmpeg.mjs';
 
@@ -29,7 +29,8 @@ const TOOLS_PATH = process.env.DSH_TOOLS_PATH
   ?? join(homedir(), '.dsh', 'profiles', 'node_modules', '@deepseek-ai', 'dsh-tools', 'lib', 'index.js');
 process.env.DSH_TOOLS_PATH = TOOLS_PATH;
 
-const FIXTURE = join('.tmp', 'start-meta-clip.mp4');
+// 绝对路径：工具入口只收本机文件的绝对路径
+const FIXTURE = resolve('.tmp', 'start-meta-clip.mp4');
 
 function makeFixture() {
   if (existsSync(FIXTURE) && statSync(FIXTURE).size > 5000) return FIXTURE;

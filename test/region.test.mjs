@@ -132,7 +132,7 @@ test('regression: obs / camera / file 不变', () => {
   );
   assert.deepEqual(
     sourceArgs({ kind: 'file', path: 'C:\\a.mp4', realtime: true }, { platform: 'win32' }),
-    ['-re', '-i', 'C:\\a.mp4'],
+    ['-re', '-protocol_whitelist', 'file', '-i', 'C:\\a.mp4'],
   );
 });
 

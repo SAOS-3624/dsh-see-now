@@ -14,12 +14,13 @@ import { execFileSync } from 'node:child_process';
 import { FFMPEG, ffmpegOk } from './ffmpeg.mjs';
 import { existsSync, mkdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 const TOOLS_PATH = process.env.DSH_TOOLS_PATH
   ?? join(homedir(), '.dsh', 'profiles', 'node_modules', '@deepseek-ai', 'dsh-tools', 'lib', 'index.js');
 
-const FIXTURE = join('.tmp', 'e2e-clip.mp4');
+// 绝对路径：工具入口只收本机文件的绝对路径
+const FIXTURE = resolve('.tmp', 'e2e-clip.mp4');
 
 function makeFixture() {
   if (existsSync(FIXTURE) && statSync(FIXTURE).size > 10_000) return FIXTURE;

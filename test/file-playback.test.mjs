@@ -23,7 +23,7 @@ function makeFixture() {
 }
 
 test('文件源参数支持非负起点并拒绝非法值', () => {
-  assert.deepEqual(sourceArgs({ kind: 'file', path: 'a.mp4', seek: 8 }), ['-ss', '8', '-i', 'a.mp4']);
+  assert.deepEqual(sourceArgs({ kind: 'file', path: 'a.mp4', seek: 8 }), ['-ss', '8', '-protocol_whitelist', 'file', '-i', 'a.mp4']);
   assert.throws(() => sourceArgs({ kind: 'file', path: 'a.mp4', seek: -1 }), RangeError);
 });
 

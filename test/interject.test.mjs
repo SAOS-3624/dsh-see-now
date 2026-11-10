@@ -16,7 +16,8 @@ const TOOLS_PATH = process.env.DSH_TOOLS_PATH
   ?? join(homedir(), '.dsh', 'profiles', 'node_modules', '@deepseek-ai', 'dsh-tools', 'lib', 'index.js');
 
 const HOME = resolve('.tmp/see-home');
-const FIXTURE = join('.tmp', 'interject-clip.mp4');
+// 绝对路径：工具入口只收本机文件的绝对路径
+const FIXTURE = resolve('.tmp', 'interject-clip.mp4');
 
 function makeFixture() {
   if (existsSync(FIXTURE) && statSync(FIXTURE).size > 10_000) return FIXTURE;

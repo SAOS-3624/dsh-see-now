@@ -202,8 +202,11 @@ export function sourceArgs(
     case 'file': {
       const seek = s.seek ?? s.startSec;
       if (seek != null && (!Number.isFinite(seek) || seek < 0)) throw new RangeError('file seek 必须是非负秒数');
-      // `realtime` 才加 -re；离线跑要看的是「管线本身多快」，不能被播放速度骗了
-      return [...(s.realtime ? ['-re'] : []), ...(seek > 0 ? ['-ss', String(seek)] : []), '-i', String(s.path)];
+      // `realtime` 才加 -re；离线跑要看的是「管线本身多快」，不能被播放速度骗了。
+      // `-protocol_whitelist file`：文件源只该读本地文件。不加的话 path 写成
+      // `http:` / `tcp:` / `concat:` 之类，ffmpeg 会照着协议去连（工具入口另有路径校验，这里兜底）。
+      return [...(s.realtime ? ['-re'] : []), ...(seek > 0 ? ['-ss', String(seek)] : []),
+        '-protocol_whitelist', 'file', '-i', String(s.path)];
     }
     case 'rtmp':
       return s.listen === false ? ['-i', String(s.url)] : ['-listen', '1', '-i', String(s.url)];
