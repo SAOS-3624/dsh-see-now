@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Refactor — 裁切预算只留一套实现（和 storyboard 对齐）
+
+先把 `stretch` 夹进预算（`effectiveStretch`），再生成候选 —— 删掉上一轮临时加的
+`fitsCrop()` 逐行闸门。两套机制并存的坏处是"整行被丢弃"：0.1 预算下 9 帧的序列只能装 7 帧，
+比完全不裁（9 帧）还差。现在只有一套换算，storyboard 的 `pack.js` 同步改成一样，语义一字不差。
+行为不变（默认 `maxCrop: 0`），494 pass。
+
 > ⚠️ **0.2.3 从来没发出去过**（`main` 上有 release 提交，但 `npm publish` 没跑，registry 上
 > 只有 0.2.2）。下次发版时要把 0.2.3 的帧率修正一起带上，版本号直接取下一个。
 >
