@@ -340,6 +340,27 @@ export const DEFAULTS = Object.freeze({
    * （实测：25 秒素材出 9 张，每张 1 帧）。给到 1000，DP 就只会往一个箱子里压。
    */
   binCost: 1000,
+  /**
+   * **为了凑行高，最多允许裁掉多少画面**（0 = 一格都不裁，0.1 = 最多裁 10%）。
+   *
+   * 排布器原来允许一格比画面宽/窄 30%，靠 cover 把溢出那一维裁掉 —— 那是拿真画面换张数：
+   * 混合档位的一张图里，多数格子会少掉 10~23% 的画面（左右或上下）。裁掉的那部分
+   * 模型**永远看不到**，不只是"糊一点"。
+   *
+   * **默认 0**：一格都不裁。实测（400 条随机档位序列、binCost 1000、单张装帧数）：
+   *
+   * | maxCrop | 平均每张装 | 相对不裁 |
+   * |---|---|---|
+   * | **0** | **8.28 帧** | —— |
+   * | 0.10 | 8.35 帧 | +0.8% |
+   * | 0.20 | 8.70 帧 | +5.1% |
+   * | 0.30（老行为） | 9.02 帧 | +8.9% |
+   *
+   * 也就是说：**裁掉 10% 的画面只换来 0.8% 的装帧数**，20% 才换 5%。实时场景一张图
+   * 才 200 出头 token，多 flush 一次的代价很小，而裁掉的那圈画面模型**永远看不到**。
+   * 所以默认不裁；想要老行为的人在 `~/.dsh/see-now.json` 写 `"maxCrop": 0.3`。
+   */
+  maxCrop: 0,
   /** 出图队列深度。0 = 不丢（离线跑用），线上是 1：宁可丢老画面，不给模型看十几秒前的事。 */
   queueDepth: 1,
   /**
@@ -382,6 +403,11 @@ export const REF_SCORE = 4;
 export function createPipeline(opts = {}) {
   const o = { ...DEFAULTS, ...opts };
   const { width, height, fps } = o;
+  /** 排布的裁切预算（0..0.9）。`maxCrop` 是"最多裁掉多少"，两个方向同一个数。 */
+  const cropBudget = Object.freeze({
+    cropX: Math.max(0, Math.min(0.9, Number(o.maxCrop) || 0)),
+    cropY: Math.max(0, Math.min(0.9, Number(o.maxCrop) || 0)),
+  });
 
   /**
    * region 模式（只抓一块竖屏窗口）：`o.region` 存在时走一套独立的几何。
@@ -604,7 +630,7 @@ export function createPipeline(opts = {}) {
    * 实测帧密场景还是 4 帧/张、token/分一点没省。
    */
   function plan() {
-    return packTiers(seqOf(frames), { binCost: o.binCost, packMode: o.packMode });
+    return packTiers(seqOf(frames), { binCost: o.binCost, packMode: o.packMode, crop: cropBudget });
   }
 
   function checkFlush(t) {
@@ -641,7 +667,7 @@ export function createPipeline(opts = {}) {
     // "4 个 1 档装得进一张"刚好咬住（见 `splitOneBin` 的注释）。这里换成显式规则：
     // 不依赖那两个数字，改加成参数也不会静默交出一张糊图。
     if (p.bins > 1) {
-      const segs = splitOneBin(seqOf(frames), { binCost: o.binCost, packMode: o.packMode });
+      const segs = splitOneBin(seqOf(frames), { binCost: o.binCost, packMode: o.packMode, crop: cropBudget });
       const keep = segs[0].length;
       const carry = frames.slice(keep);
       if (carry.length === 0) { flush(t, 'full'); return; }   // 兜底：不该发生
@@ -776,7 +802,7 @@ export function createPipeline(opts = {}) {
     // 清空了 sheets 却交不出图（插话时用户什么都看不到）。
     if (regionAspect) return flushRegion(batch, t, why);
     const seq = seqOf(batch);
-    const p = packTiers(seq, { binCost: o.binCost, packMode: o.packMode });
+    const p = packTiers(seq, { binCost: o.binCost, packMode: o.packMode, crop: cropBudget });
     if (!p.cells.length) return;
     /**
      * **一张图只画一个箱子**。`solve` 允许跨箱（DP 里封箱是要付 `binCost` 的），
@@ -1087,7 +1113,7 @@ export function createPipeline(opts = {}) {
       let guard = 0;
       while (frames.length && guard < 64) {
         guard += 1;
-        const segs = splitOneBin(seqOf(frames), { binCost: o.binCost, packMode: o.packMode });
+        const segs = splitOneBin(seqOf(frames), { binCost: o.binCost, packMode: o.packMode, crop: cropBudget });
         if (segs.length <= 1) { flush(lastBound, 'end'); break; }
         const keep = segs[0].length;
         const carry = frames.slice(keep);

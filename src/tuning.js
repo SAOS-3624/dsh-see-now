@@ -111,6 +111,22 @@ export const TUNING_DEFAULTS = Object.freeze({
    * 所以留着不影响日常屏幕，只在暗场/宽银幕上起作用。
    */
   scoreNormalize: true,
+  /**
+   * **为凑行高最多裁掉多少画面**（`pack.solve` 的裁切预算，默认 0.1）。
+   *
+   * 老行为是 0.3：格子可以被拉成 1.3:1 再 cover 裁掉溢出一维 —— 混合档位的一张图里
+   * 多数格子会少掉 10~23% 的画面，而那部分模型**永远看不到**。
+   *
+   * | 值 | 效果（400 条随机序列实测，平均每张能装几帧） |
+   * |---|---|
+   * | `0`（默认） | 一格不裁 · 8.28 帧 |
+   * | `0.1` | 最多裁 10% · 8.35 帧（+0.8%，不值） |
+   * | `0.2` | 最多裁 20% · 8.70 帧（+5.1%） |
+   * | `0.3` | 0.4.0 之前的老行为 · 9.02 帧（+8.9%） |
+   *
+   * 默认取 0：多 flush 一次很便宜，被裁掉的那圈画面却永远看不到。
+   */
+  maxCrop: 0,
 });
 
 /**
@@ -436,6 +452,14 @@ export function readTuning({ env = process.env, readFile = readFileSync } = {}) 
     else warnings.push('scoreNormalize 只能是 true / false，已用默认 true');
   }
 
+  // 裁切预算：0–0.9 的小数。写 1 或 30 这种（把百分比当小数写）要报出来，别静默取默认
+  let maxCrop = TUNING_DEFAULTS.maxCrop;
+  if (raw.maxCrop !== undefined) {
+    const n = Number(raw.maxCrop);
+    if (Number.isFinite(n) && n >= 0 && n <= 0.9) maxCrop = n;
+    else warnings.push('maxCrop 必须是 0–0.9 的小数（0.2 = 最多裁 20%），已用默认 0');
+  }
+
   const listenCfg = readListen(raw.listen);
   warnings.push(...listenCfg.warnings);
 
@@ -455,6 +479,7 @@ export function readTuning({ env = process.env, readFile = readFileSync } = {}) 
     speechPacing,
     changeLog,
     scoreNormalize,
+    maxCrop,
     listen: listenCfg.listen,
     path,
     warnings,
@@ -467,7 +492,7 @@ export function readTuning({ env = process.env, readFile = readFileSync } = {}) 
 export const WRITABLE_KEYS = Object.freeze([
   'maxAutonomousWakes', 'idleStopMin', 'wakeBatch', 'imageTrigger', 'imageKeep', 'tierStyle', 'tierMap',
   'tierMode', 'tierCurve', 'tierThresholds',
-  'defaultPace', 'speechPacing', 'scoreNormalize', 'listen',
+  'defaultPace', 'speechPacing', 'scoreNormalize', 'maxCrop', 'listen',
 ]);
 
 /** `listen` 段能改的键。 */

@@ -261,6 +261,11 @@ export function createRunner({
    * 调用方显式传 `opts.scoreNormalize` 时以调用方为准（同 `tierStyle`）。
    */
   scoreNormalize = true,
+  /**
+   * 为凑行高最多裁掉多少画面（`~/.dsh/see-now.json` 的 `maxCrop`，默认 0 = 一格不裁）。
+   * 0.3 = 0.4.0 之前的老行为：每张多装 8.9% 帧，但格子要裁掉三成画面。
+   */
+  maxCrop = 0,
 } = {}) {
   let pipeline = null;   // 当前（或刚停的）引擎 —— 停采集后仍留着，好把队列里剩的图发完
   let running = false;
@@ -672,6 +677,7 @@ export function createRunner({
       // 打分口径的补偿（默认开）。和 changeLog 一样是会话级偏好，但**允许单次覆盖** ——
       // 离线标定要能一次开关，不然只能改配置文件再跑。
       scoreNormalize: opts.scoreNormalize ?? scoreNormalize,
+      maxCrop: opts.maxCrop ?? maxCrop,
       // 音量条：直接问听声音那条链要 —— 那边已经在算 RMS 了（断句要用），
       // 这里只是把它按时间窗取出来画成柱子，**不额外解码一次音频**。
       audio: { levels: (a, b) => listener.levelsBetween(a, b) },

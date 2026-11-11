@@ -626,6 +626,8 @@ async function registerAll(ctx) {
     tierThresholds: tuning.tierThresholds,
     // 亮度归一 + 黑边补偿（默认开；关掉 = 回到 0.1.3 的绝对分）
     scoreNormalize: tuning.scoreNormalize,
+    // 为凑行高最多裁掉多少画面（`maxCrop`，默认 0 = 一格不裁；0.3 = 老行为）
+    maxCrop: tuning.maxCrop,
   });
   disposers.push(() => runner.stop());
 

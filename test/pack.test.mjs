@@ -11,15 +11,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { DEFAULT_GROW, DEFAULT_STRETCH, rowOptions, solve } from '../src/pack.js';
+import {
+  DEFAULT_CROP, DEFAULT_GROW, DEFAULT_STRETCH, effectiveStretch, rowOptions, solve, stretchForCrop,
+} from '../src/pack.js';
 
-test('DEFAULT_STRETCH 是 0.3，而且它确实比 0.2 排得紧', () => {
+/** 拉伸要被放行，必须给裁切预算；这两个"大方"的预算只给这类几何测试用。 */
+const ANY = Object.freeze({ cropX: 0.9, cropY: 0.9 });
+
+test('DEFAULT_STRETCH 是 0.3，而且它确实比 0.2 排得紧（给了预算时）', () => {
   assert.equal(DEFAULT_STRETCH, 0.3, '容差被回滚的话这条会红');
   // 这条序列在 0.2 下要 2 张（44.3%），0.3 下 1 张（89.7%）。挑它是因为差一整张图，
   // 不是靠小数点后的 fill —— 那种断言换平台就飘。
   const seq = [3, 4, 4, 4, 7, 7, 7, 2, 2];
-  const now = solve(seq, { binCost: 1.02 });
-  const old = solve(seq, { stretch: 0.2, binCost: 1.02 });
+  const now = solve(seq, { stretch: 0.3, crop: ANY, binCost: 1.02 });
+  const old = solve(seq, { stretch: 0.2, crop: ANY, binCost: 1.02 });
   assert.equal(old.bins, 2, '0.2 容差下这 9 帧应该装不下');
   assert.equal(now.bins, 1, '0.3 容差下应该刚好一张');
   assert.ok(now.fill > old.fill + 0.2, `占用率该明显更高：${now.fill} vs ${old.fill}`);
@@ -30,24 +35,25 @@ test('flat 只在该行 最宽/最窄 <= (1+τ)² 时出现（别偷偷拉过头
   //   τ=0.2：边界 (1.2)² = 1.44 → 1.5 超了，不许 flat。
   //          旧的 (1+τ)/(1−τ) = 1.5 会放行，最窄格被拉到 1.25（+25%）。
   //   τ=0.3：边界 (1.3)² = 1.69 → 1.5 放行。
-  assert.equal(rowOptions([2, 4, 4, 4], DEFAULT_GROW, 0.2, true).some((o) => o.flat), false,
+  assert.equal(rowOptions([2, 4, 4, 4], DEFAULT_GROW, 0.2, true, ANY).some((o) => o.flat), false,
     '20% 容差下这行不该有 flat 候选');
-  assert.equal(rowOptions([2, 4, 4, 4], DEFAULT_GROW, 0.3, true).some((o) => o.flat), true,
+  assert.equal(rowOptions([2, 4, 4, 4], DEFAULT_GROW, 0.3, true, ANY).some((o) => o.flat), true,
     '30% 容差下应该允许');
 });
 
 test('缓存键必须区分 stretch（0.2 和 0.3 不能共用候选）', () => {
   // 这两个值命中的是不同的 flat 行高。键里只编码 "stretch > 0.15" 的旧实现会串。
-  const a = rowOptions([2, 4, 4, 4], DEFAULT_GROW, 0.2, true);
-  const b = rowOptions([2, 4, 4, 4], DEFAULT_GROW, 0.3, true);
+  const a = rowOptions([2, 4, 4, 4], DEFAULT_GROW, 0.2, true, ANY);
+  const b = rowOptions([2, 4, 4, 4], DEFAULT_GROW, 0.3, true, ANY);
   assert.notDeepEqual(a, b, '0.2 和 0.3 必须算出不同的候选');
-  assert.deepEqual(rowOptions([2, 4, 4, 4], DEFAULT_GROW, 0.2, true), a, '回头再算 0.2 仍要拿到 0.2 的结果');
+  assert.deepEqual(rowOptions([2, 4, 4, 4], DEFAULT_GROW, 0.2, true, ANY), a,
+    '回头再算 0.2 仍要拿到 0.2 的结果');
 });
 
 test('部分拉伸：矮格被拉高，但不超过行高、也不超过 (1+τ) 倍', () => {
   // [1,4,4] 一行里宽度差 2 倍，flat 不可行（超过 (1+τ)²），只能靠逐格拉。
   const tau = 0.3;
-  const p = solve([1, 4, 4], { stretch: tau, binCost: 1.02 });
+  const p = solve([1, 4, 4], { stretch: tau, crop: ANY, binCost: 1.02 });
   const stretched = p.cells.filter((c) => c.h > c.w + 1e-9);
   assert.ok(stretched.length > 0, '宽度不等又没有 flat 的行，应该有格子被拉高');
   for (const c of p.cells) {
@@ -107,4 +113,36 @@ test('packTiers：packMode 决定走哪套，默认仍是行式', async () => {
   const sky = packTiers(seq, { packMode: 'skyline' });
   assert.equal(sky.cells.length, seq.length, '天幕也一样不能丢帧');
   assert.ok(sky.bins >= 1);
+});
+
+/* ── 裁切预算（0.4.0）：默认一格都不裁 ────────────────────────────────────── */
+
+test('默认一格都不裁：不给预算时所有格子都是精确比例', () => {
+  for (const seq of [[3, 4, 4, 4, 7, 7, 7, 2, 2], [2, 8, 7, 3, 8, 8], [1, 4, 4], [5, 6]]) {
+    const p = solve(seq, { binCost: 1000 });
+    for (const c of p.cells) {
+      assert.ok(Math.abs(c.h - c.w) < 1e-9,
+        `${seq.join(',')} 出了非方形格 ${c.w.toFixed(3)}×${c.h.toFixed(3)}（= 把画面裁了）`);
+    }
+  }
+});
+
+test('maxCrop 是硬上限：0.1 的预算最多裁 10%', () => {
+  const seq = [1, 4, 4, 2, 8, 3, 3, 7, 7];
+  for (const mc of [0, 0.05, 0.1, 0.2]) {
+    const p = solve(seq, { stretch: 0.3, crop: { cropX: mc, cropY: mc }, binCost: 1000 });
+    for (const c of p.cells) {
+      // 裁掉的比例 = 1 − 短边/长边（不是长宽比偏差：1:1.0526 只裁掉 5%）
+      const cut = 1 - Math.min(c.h, c.w) / Math.max(c.h, c.w);
+      assert.ok(cut <= mc + 1e-9, `预算 ${mc} 却裁了 ${(cut * 100).toFixed(1)}%`);
+    }
+  }
+});
+
+test('stretchForCrop / effectiveStretch：预算换算与夹逼', () => {
+  assert.equal(stretchForCrop(DEFAULT_CROP), 0, '0 预算 = 0 拉伸');
+  assert.ok(Math.abs(stretchForCrop({ cropX: 0.5, cropY: 0.5 }) - 1) < 1e-9, '裁一半 = 拉一倍');
+  // 预算永远压得住调用方传的 stretch
+  assert.ok(Math.abs(effectiveStretch(0.3, { cropX: 0.1, cropY: 0.1 }) - 0.1 / 0.9) < 1e-9);
+  assert.equal(effectiveStretch(0.3, DEFAULT_CROP), 0, '没预算时不论传多少都是 0');
 });
