@@ -165,6 +165,10 @@ USE_GPU = NATIVE or os.environ.get("DSH_GLASS_GPU") == "1"
 # 气泡底板（和 glass_geometry.BUBBLE_PLATE 同一个开关）：关掉 = 回到逐字翻色，
 # 只用来拍新旧对比图，正常别动。
 PLATE = os.environ.get("DSH_GLASS_PLATE", "1") != "0"
+# 顶栏那个 ‖/▶ 画不画。**由宿主决定**：动作是写进 `window-outbox.jsonl` 的，
+# 宿主得有消费者才有意义 —— 没消费者的宿主（see-now 这一版还没有）画出来就是
+# "按了没反应、字还从 ‖ 变成 ▶"的假按钮，比没有更糟。`DSH_WINDOW_PAUSE=0` 关掉。
+PAUSE_BTN = os.environ.get("DSH_WINDOW_PAUSE", "1") != "0"
 
 # 样式预设。`auto` 只出现在配置里（表示"看环境自动选"），解析后只会是下面三个之一。
 STYLE_LIVE, STYLE_FROST, STYLE_SOLID = "live", "frost", "solid"
@@ -540,6 +544,9 @@ class LiveGlass:
         self._mic_proc = None
         self._protocol = WindowProtocol() if WindowProtocol is not None else None
         self._collapsed = False
+        # ⏸ 暂停（只停采集、窗留着）。**不落盘**：窗口重启后按"在看"处理 ——
+        # 持久化的话下次打开是死的，用户只会觉得"怎么又不动了"，还查不出原因。
+        self._paused = False
         self._saved_h = DEFAULT_H
         self._mode = window_mode(cfg)
         self._tray = None
@@ -864,6 +871,9 @@ class LiveGlass:
             elif action == "danmaku":
                 write_config({"danmaku": bool(value)})
                 self._sync_danmaku()
+            elif action in ("pause", "resume"):
+                # 宿主是权威：它那边可能因为重启循环而恢复成"在看"，窗口要跟上
+                self._set_paused(action == "pause")
             elif action == "hide":
                 self._apply_mode(MODE_HIDDEN, save=True)
             elif action == "show":
@@ -1265,6 +1275,34 @@ class LiveGlass:
         self._report("danmaku", value=want)
         return "break"
 
+    def toggle_pause(self, _event=None):
+        """标题栏那个 ‖/▶：**暂停/继续采集，窗口留着**（issue #56 第 3 条）。
+
+        必须和 `✕` 分开：`✕` 是"不看了"（停采集 + 落挂断记录），按一次就得重新调
+        工具才回来；这个是"歇会儿"，插件那边把时钟冻住、不叫醒模型，按 ▶ 从当前
+        进度接着看，暂停那段不补。
+
+        状态**不落盘**：窗口重启后按"在看"处理。写盘的话下次打开就是一个不会动的窗，
+        用户只会觉得"又坏了"，而且从界面上看不出是被暂停了。
+        """
+        self._set_paused(not self._paused, report=True)
+        return "break"
+
+    def _set_paused(self, paused, report=False):
+        """`report=True` 才回写宿主 —— 宿主同步状态（control 事件）时不要再回声。"""
+        paused = bool(paused)
+        if paused == self._paused:
+            return
+        self._paused = paused
+        if report:
+            self._report("pause" if paused else "resume")
+        self._toast = "已暂停 · 点 ▶ 继续" if paused else "继续看"
+        self._layout()
+        try:
+            self.root.after(1800, self._clear_toast)
+        except Exception:
+            pass
+
     def _clear_toast(self) -> None:
         if not self._toast:
             return
@@ -1665,14 +1703,19 @@ class LiveGlass:
         count = self._toast or self.feed.status or f"{len(self.feed.messages)} 条"
         nx = title_x + self.fonts.get(16, True).measure(name) + 10
         tone = "#9fe1cb" if self._toast else ("#ffb4b4" if self.feed.status else "#dbe6f5")
-        # 右边四个按钮占 176px。状态行不截断的话，一条长 meta（宿主的报错动辄
-        # 七八十字）会直接糊到按钮上 —— 之前只有一个 ▾/✕ 时不明显，现在四个按钮
-        # 一撞就整排看不见。
-        count = self._clip_text(count, 11, max(40, (w - 176) - nx - 8))
+        # 右边五个按钮占 214px（宿主不接暂停时只画四个，占 176px）。状态行不截断的话，
+        # 一条长 meta（宿主的报错动辄七八十字）会直接糊到按钮上 —— 之前只有一个 ▾/✕ 时
+        # 不明显，现在五个按钮一撞就整排看不见。
+        count = self._clip_text(count, 11, max(40, (w - (214 if PAUSE_BTN else 176)) - nx - 8))
         self.text.draw(nx, cy, count, anchor="w", fill=tone, size=11)
+        # 「‖」= 暂停采集（暂停时变 ▶ 并高亮，press 一下就从当前进度接着看）；
         # 「弹」= 弹幕开关（亮蓝 = 开，暗灰 = 关）；「—」= 最小化到托盘；
-        # 「▾」= 折叠成横条；「✕」= 关闭。四个按钮，从右往左数。
+        # 「▾」= 折叠成横条；「✕」= 关闭。五个按钮，从右往左数。
         dm_on = danmaku_wanted()
+        if PAUSE_BTN:
+            self.text.draw(w - 206, 38, "▶" if self._paused else "‖", anchor="w",
+                           fill="#7fc4ff" if self._paused else "#7f8da3", size=12,
+                           tags=("pause",))
         self.text.draw(w - 168, 38, "弹", anchor="w",
                        fill="#7fc4ff" if dm_on else "#55637a", size=12, tags=("danmaku",))
         self.text.draw(w - 130, 38, "—", anchor="w", fill="#7f8da3", size=13,
@@ -1698,6 +1741,7 @@ class LiveGlass:
         c = self.canvas
         c.tag_bind("close", "<Button-1>", self._close)
         c.tag_bind("danmaku", "<Button-1>", self.toggle_danmaku)
+        c.tag_bind("pause", "<Button-1>", self.toggle_pause)
         c.tag_bind("minimize", "<Button-1>",
                    lambda _e: self._apply_mode(MODE_HIDDEN, save=True))
         c.tag_bind("collapse", "<Button-1>", self.toggle_collapse)

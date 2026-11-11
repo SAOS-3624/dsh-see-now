@@ -644,6 +644,11 @@ export async function openWindow({ force = false, log = () => {}, settleMs = 700
           // 启动失败时那个 MessageBox 的标题跟着走，否则用户看到
           // "dsh-watch-together" 会以为自己装错了包（issue #32 第 1 条）
           DSH_WINDOW_BRAND: 'dsh-see-now',
+          // 顶栏的 ‖/▶（暂停采集）**这一版还接不了**：窗口把动作写进
+          // `window-outbox.jsonl`，而 see-now 这侧还没有消费者 —— 画出来就是
+          // "点了没反应、字还从 ‖ 变 ▶"的假按钮。等接上 in-process 的
+          // `runner.pause()` 再去掉这一行（脚本本身默认是画的）。
+          DSH_WINDOW_PAUSE: '0',
         },
       });
     } catch (e) {
