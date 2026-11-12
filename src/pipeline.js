@@ -20,7 +20,7 @@
 import { BAR_WINDOW, SCAN_H, SCAN_W, bgBorderChanged, bgKeep, createScorer, scorePair } from './cuts.js';
 import { createTiers, applyStrategy } from './tiers.js';
 import { packTiers, toRects, splitOneBin } from './pack.js';
-import { composePacked, drawAudioStrip, stripHeight } from './sheet.js';
+import { composePacked, cropToContent, drawAudioStrip, stripHeight } from './sheet.js';
 import { encodePng } from './png.js';
 import { gridRects } from './layout.js';
 
@@ -762,9 +762,11 @@ export function createPipeline(opts = {}) {
   function flushRegion(batch, t, why) {
     const n = batch.length;
     const g = gridRects(n, width, height, regionAspect);
+    // 帧少时网格下面会空一条 —— 只缩画布、不动格子（见 `sheet.js::cropToContent`）
+    const crop = cropToContent(g.rects, g.width, g.height);
     const cells = batch.map((f) => ({ buffer: f.buf, w: width, h: height }));
     const img = composePacked({
-      frames: cells, rects: g.rects, width: g.width, height: g.height, burn: 'index',
+      frames: cells, rects: crop.rects, width: crop.width, height: crop.height, burn: 'index',
     });
     const png = encodePng(img.buffer, img.width, img.height, { level: 3 });
     if (o.queueDepth > 0 && sheets.length >= o.queueDepth) sheets.shift();
@@ -785,7 +787,7 @@ export function createPipeline(opts = {}) {
       frames: batch.map((f) => ({
         t: +f.t.toFixed(2), tier: 1, level: f.level, via: f.via, wall: f.wall ?? null,
       })),
-      cells: g.rects.map((r) => ({ px: r.px, py: r.py, pw: r.pw, ph: r.ph, tier: 1 })),
+      cells: crop.rects.map((r) => ({ px: r.px, py: r.py, pw: r.pw, ph: r.ph, tier: 1 })),
     };
     sheets.push(sheet);
     stats.sheets += 1;
@@ -815,7 +817,11 @@ export function createPipeline(opts = {}) {
     const kept = p.cells.filter((c) => c.bin === 0);
     const used = batch.slice(0, kept.length);
     if (used.length < batch.length) stats.overflow += 1;
-    const rects = toRects(kept, { width, height, gutter: 0 });
+    // **整条空着的带子不发**：排布是按档位走的，帧少时下面会空出半幅灰条，
+    // 而灰条照样算进 token（图按画布尺寸计费）。这里只缩画布 + 平移坐标，
+    // 格子的 `pw/ph` 一个都不动 —— 裁的是画布，不是画面。
+    const crop = cropToContent(toRects(kept, { width, height, gutter: 0 }), width, height);
+    const rects = crop.rects;
     /**
      * 帧直接以 `{src, sw, sh}` 交给 `composePacked`：它内部用 `coverIntoAt`
      * 把每一帧缩进画布的对应格子。
@@ -826,11 +832,11 @@ export function createPipeline(opts = {}) {
     const cells = used.map((f) => ({ src: f.buf, sw: width, sh: height }));
     const stripH = stripHeightFor();
     const img = composePacked({
-      frames: cells, rects, width, height, burn: 'index', stripH,
+      frames: cells, rects, width: crop.width, height: crop.height, burn: 'index', stripH,
     });
     // 音轨条：响度 + 切点刻度。**画布已经预留好高度**，这里是就地填底部，
     // 不再额外分配 + 拷贝一整张图（省 1.1MB/张）。
-    if (stripH) drawAudioStrip(img.buffer, img.width, img.height, height, audioOf(used[0], used[used.length - 1]));
+    if (stripH) drawAudioStrip(img.buffer, img.width, img.height, crop.height, audioOf(used[0], used[used.length - 1]));
     const png = encodePng(img.buffer, img.width, img.height, { level: 3 });
     // 占用率按**这张图上真有的格子**算：单箱时与 `p.area / p.bins` 完全等价
     const area = kept.reduce((acc, c) => acc + c.w * c.h, 0);

@@ -161,6 +161,58 @@ export function drawPadding(buf, width, height, x, y, cellW, cellH) {
 }
 
 /**
+ * 把"整行都空着"的空白带从画布上裁掉。
+ *
+ * ## 为什么值得
+ *
+ * 排布是按"档位"走的，帧少时下面会空出整条（两帧并排 = 上半幅有图、下半幅全是灰条）。
+ * 那块灰**要花钱**：图按画布尺寸计费，灰条占的面积照样算进 token。裁掉之后
+ * 两帧那档从 798×450 变成 798×225，灰条没了，格子的像素一点没动。
+ *
+ * ## 裁的是画布，不是画面
+ *
+ * 只改 `width/height` 并整体平移 `px/py`，`pw/ph` 一个都不动 —— 每一帧还是原尺寸、
+ * 原比例，没有缩放也没有裁边。"格子尺寸"是排布算出来的，这里不许二次解释。
+ *
+ * ## 只对"整行都空"有效
+ *
+ * 行内还空着半格（比如 3 帧时右上角那个洞）时，内容框仍然是整幅，裁不动。
+ * 想让那种格子也铺满，只能改排布（裁画面或重排），不是这个函数的职责。
+ *
+ * @param {Array<{px:number,py:number,pw:number,ph:number}>} rects 像素矩形（`toRects` 的输出）
+ * @param {number} width  当前画布宽
+ * @param {number} height 当前画布高
+ * @returns {{rects:Array,width:number,height:number,cropped:boolean}}
+ *          没有可裁的就**原样返回同一个数组**（不复制，热路径上每帧都要调）。
+ */
+export function cropToContent(rects, width, height) {
+  if (!Array.isArray(rects) || rects.length === 0) {
+    return { rects, width, height, cropped: false };
+  }
+  let x0 = width;
+  let y0 = height;
+  let x1 = 0;
+  let y1 = 0;
+  for (const r of rects) {
+    if (r.px < x0) x0 = r.px;
+    if (r.py < y0) y0 = r.py;
+    if (r.px + r.pw > x1) x1 = r.px + r.pw;
+    if (r.py + r.ph > y1) y1 = r.py + r.ph;
+  }
+  x0 = Math.max(0, x0);
+  y0 = Math.max(0, y0);
+  x1 = Math.min(width, x1);
+  y1 = Math.min(height, y1);
+  const w = Math.max(1, x1 - x0);
+  const h = Math.max(1, y1 - y0);
+  if (w >= width && h >= height) return { rects, width, height, cropped: false };
+  const moved = x0 === 0 && y0 === 0
+    ? rects
+    : rects.map((r) => ({ ...r, px: r.px - x0, py: r.py - y0 }));
+  return { rects: moved, width: w, height: h, cropped: true };
+}
+
+/**
  * 把已经抓好的帧按**可变矩形**拼成一张画布。
  *
  * 与旧版 `composeSheet` 的区别：不再假设 cols×rows 的统一网格。矩形来自
