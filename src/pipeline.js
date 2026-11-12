@@ -20,7 +20,7 @@
 import { BAR_WINDOW, SCAN_H, SCAN_W, bgBorderChanged, bgKeep, createScorer, scorePair } from './cuts.js';
 import { createTiers, applyStrategy } from './tiers.js';
 import { packTiers, toRects, splitOneBin } from './pack.js';
-import { composePacked, cropToContent, drawAudioStrip, stripHeight } from './sheet.js';
+import { composePacked, lay, drawAudioStrip, stripHeight } from './sheet.js';
 import { encodePng } from './png.js';
 import { gridRects } from './layout.js';
 
@@ -762,8 +762,8 @@ export function createPipeline(opts = {}) {
   function flushRegion(batch, t, why) {
     const n = batch.length;
     const g = gridRects(n, width, height, regionAspect);
-    // 帧少时网格下面会空一条 —— 只缩画布、不动格子（见 `sheet.js::cropToContent`）
-    const crop = cropToContent(g.rects, g.width, g.height);
+    // 一格铺满 / 整行空着就裁掉（见 `sheet.js::lay`）
+    const crop = lay(g.rects, g.width, g.height);
     const cells = batch.map((f) => ({ buffer: f.buf, w: width, h: height }));
     const img = composePacked({
       frames: cells, rects: crop.rects, width: crop.width, height: crop.height, burn: 'index',
@@ -820,7 +820,7 @@ export function createPipeline(opts = {}) {
     // **整条空着的带子不发**：排布是按档位走的，帧少时下面会空出半幅灰条，
     // 而灰条照样算进 token（图按画布尺寸计费）。这里只缩画布 + 平移坐标，
     // 格子的 `pw/ph` 一个都不动 —— 裁的是画布，不是画面。
-    const crop = cropToContent(toRects(kept, { width, height, gutter: 0 }), width, height);
+    const crop = lay(toRects(kept, { width, height, gutter: 0 }), width, height);
     const rects = crop.rects;
     /**
      * 帧直接以 `{src, sw, sh}` 交给 `composePacked`：它内部用 `coverIntoAt`

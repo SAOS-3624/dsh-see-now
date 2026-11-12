@@ -14,7 +14,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cropToContent } from '../src/sheet.js';
+import { cropToContent, lay } from '../src/sheet.js';
 
 const W = 798;
 const H = 450;
@@ -83,4 +83,49 @@ test('空输入 / 非数组：原样返回，不炸', () => {
   const b = cropToContent(null, W, H);
   assert.equal(b.width, W);
   assert.equal(b.height, H);
+});
+
+// ---------------------------------------------------------------- lay：先铺满，再裁
+
+test('lay 单帧：同比例 → 铺满整幅（清晰度不许因为"没有灰条"而缩水）', () => {
+  const out = lay([rect(0, 0, 399, 225)], W, H);
+  assert.equal(out.filled, true);
+  assert.equal(out.cropped, false);
+  assert.equal(out.width, W);
+  assert.equal(out.height, H);
+  assert.deepEqual(
+    [out.rects[0].px, out.rects[0].py, out.rects[0].pw, out.rects[0].ph],
+    [0, 0, W, H],
+  );
+});
+
+test('lay 单帧但比例不同（region 窄窗）：不铺满，只裁', () => {
+  // 一格 200×450 在 798×450 的画布上：拉满会变形，所以只能裁画布
+  const out = lay([rect(0, 0, 200, 450)], W, H);
+  assert.equal(out.filled, false);
+  assert.equal(out.cropped, true);
+  assert.equal(out.width, 200);
+  assert.equal(out.height, H);
+  assert.deepEqual([out.rects[0].pw, out.rects[0].ph], [200, 450]);
+});
+
+test('lay 两帧：不铺满，走裁带（宽不变、高减半）', () => {
+  const out = lay([rect(0, 0, 399, 225), rect(399, 0, 399, 225)], W, H);
+  assert.equal(out.filled, false);
+  assert.equal(out.cropped, true);
+  assert.equal(out.width, W);
+  assert.equal(out.height, 225);
+});
+
+test('lay 已经排满：什么都不做', () => {
+  const rects = [
+    rect(0, 0, 399, 225), rect(399, 0, 399, 225),
+    rect(0, 225, 399, 225), rect(399, 225, 399, 225),
+  ];
+  const out = lay(rects, W, H);
+  assert.equal(out.filled, false);
+  assert.equal(out.cropped, false);
+  assert.equal(out.width, W);
+  assert.equal(out.height, H);
+  assert.equal(out.rects, rects);
 });

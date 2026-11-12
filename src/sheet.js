@@ -161,6 +161,40 @@ export function drawPadding(buf, width, height, x, y, cellW, cellH) {
 }
 
 /**
+ * 出图前的最后一步几何：**一格就铺满，整行空着就裁掉**。
+ *
+ * ## 为什么两件事必须在一起
+ *
+ * 它们改的是同一个东西（画布 vs 格子），而且会互相影响：只裁不铺，单帧会缩成半幅宽
+ * （一格占 1/2×1/2，裁完画布就是一半，清晰度看起来"掉了"，其实像素没变）；
+ * 只铺不裁，多帧下面的灰条还在。所以按顺序做：先补满（改格子）、再裁（改画布）。
+ *
+ * ## 为什么铺满零代价
+ *
+ * 单格的宽高比和画布**一样**（帧本来就是按画布比例缩的），所以把格子扩到整幅
+ * 既不裁也不变形 —— 就是把那张图原样放大。宽高比不一样时（region 模式的窄窗）
+ * 绝不扩：那会把画面拉变形。
+ *
+ * @returns {{rects:Array,width:number,height:number,filled:boolean,cropped:boolean}}
+ */
+export function lay(rects, width, height) {
+  if (!Array.isArray(rects) || rects.length === 0) {
+    return { rects, width, height, filled: false, cropped: false };
+  }
+  if (rects.length === 1) {
+    const r = rects[0];
+    const sameAspect = Math.abs(r.pw / Math.max(1, r.ph) - width / Math.max(1, height)) < 0.01;
+    const smaller = r.pw < width || r.ph < height;
+    if (sameAspect && smaller) {
+      const one = [{ ...r, px: 0, py: 0, pw: width, ph: height }];
+      return { rects: one, width, height, filled: true, cropped: false };
+    }
+  }
+  const c = cropToContent(rects, width, height);
+  return { rects: c.rects, width: c.width, height: c.height, filled: false, cropped: c.cropped };
+}
+
+/**
  * 把"整行都空着"的空白带从画布上裁掉。
  *
  * ## 为什么值得

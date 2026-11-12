@@ -112,20 +112,33 @@ test('切清晰度：quality 一换，回来的图分辨率就跟着变', { skip
 
   const dims = (buf) => [buf.readUInt32BE(16), buf.readUInt32BE(20)];
 
+  /**
+   * 只断言**宽度**和"高度还在合理区间"，不再钉死高度。
+   *
+   * 为什么：帧少时下面会空出整条，`sheet.js::cropToContent` 会把那条从画布上裁掉
+   * （两帧并排 → 画面高度减半）。高度从此**取决于这一轮抓到几帧**，钉死就会变成
+   * "改一次排布就红一次"的假失败。清晰度真正改变的是宽度，这条守住就够了。
+   */
+  const check = (buffer, wantW, strip, name) => {
+    const [w, h] = dims(buffer);
+    assert.equal(w, wantW, `${name} 的宽度 = ${wantW}`);
+    assert.ok(h > strip && h <= strip + wantW, `${name} 的高度要在「画面 + ${strip}px 条」区间内，实际 ${h}`);
+  };
+
   try {
     const lo = await registered[0].execute({
       action: 'watch', source: 'file', path: clip, seconds: 20, quality: 'low',
     });
     assert.ok(lo.images?.length === 1, 'low 要出图');
-    assert.deepEqual(dims(saved[0].data), [798, 462], 'low = 798×450 画面 + 12px 音轨条（正好占满 11 行）');
+    check(saved[0].data, 798, 12, 'low = 798 宽 + 12px 音轨条');
 
     const hi = await registered[0].execute({ action: 'watch', quality: 'high' });
     assert.ok(hi.images?.length === 1, 'high 要出图（换了清晰度要立刻给一帧）');
-    assert.deepEqual(dims(saved[1].data), [1260, 756], 'high = 1260×720 + 36px 音轨条');
+    check(saved[1].data, 1260, 36, 'high = 1260 宽 + 36px 条');
     assert.equal(hi.meta.quality, 'high');
 
     const back = await registered[0].execute({ action: 'watch', quality: 'standard' });
-    assert.deepEqual(dims(saved[2].data), [1050, 630], 'standard = 1050×600 + 30px 音轨条');
+    check(saved[2].data, 1050, 30, 'standard = 1050 宽 + 30px 条');
     assert.ok(back.meta.frames >= 1);
   } finally {
     dispose();
