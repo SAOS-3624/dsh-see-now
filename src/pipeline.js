@@ -1059,8 +1059,15 @@ export function createPipeline(opts = {}) {
     if (acc >= integralNeed() && entry.t - lastBound >= o.markMinGap) {
       // 只有**真的录进去**才清零。被去重挡掉时保留累积值 —— 否则这一段的运动量
       // 白攒了，下一个采样点要重新等一整轮（实测会让出帧间隔凭空翻倍）。
-      if (keep(entry, 'mark')) acc = 0;
-      return;
+      if (keep(entry, 'mark')) { acc = 0; return; }
+      /**
+       * ⚠️ 被去重挡掉时**不能 return**。
+       *
+       * `acc` 一旦攒够就永远 ≥ `integralNeed()`，而画面没变时每一帧都会被下面的
+       * `dupMin` 挡掉 —— 直接 return 等于把**兜底（`silentFloorSec`）永远屏蔽掉**：
+       * 一帧都留不下来，这条管线在静止画面下彻底静止（手机端对着墙角实测：
+       * 一箱停在 1 格两分钟，自动看一张也发不出去）。让代码继续往下走，兜底才有机会。
+       */
     }
     let floorSec = o.silentFloorSec;
     if (o.floorGapK > 0 && gapEwma > 0) {
