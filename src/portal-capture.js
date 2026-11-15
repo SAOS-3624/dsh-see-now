@@ -48,6 +48,13 @@ export function installHint() {
 export const PORTAL_HINTS = Object.freeze({
   'dependency-missing': 'Linux 屏幕采集要 python-gobject + gstreamer + gst-plugin-pipewire：'
     + installHint(),
+  // #68：容器 / proot / SSH 里根本没有图形会话。**装包是没用的** ——
+  // 之前这条被归到 dependency-missing，issue 里那位用户把 python3-gi、gstreamer、
+  // pipewire 全装齐了还在被劝"去装包"。
+  'no-desktop-session': '这台机器没有图形会话（无 X11/Wayland、无 D-Bus session bus、'
+    + '无 xdg-desktop-portal），portal 采集起不来。**装包解决不了，该装的你已经装了。**'
+    + '常见于 proot / 容器 / SSH 无图形环境。换一个有桌面的会话跑，'
+    + '或者改用 source:"file" 看本地视频 / 手机端 see-on-phone 拍屏。',
   'permission-denied': '桌面拒绝了选屏授权：重新 watch 一次，在弹出的选屏框里点"允许 / 共享"。'
     + '之前点过拒绝的话，删掉 ~/.dsh/see-now/portal-token.json 再来。',
   'capture-failed': '共享中断：用户点了"停止共享"、显示器休眠、或 KWin 重启过。'
@@ -81,9 +88,25 @@ export function resolvePython({ env = process.env } = {}) {
   return 'python3';
 }
 
-/** 退出码 → 错误分类。worker 的约定在 portal_stream.py 文件头。 */
-function classify(code, stderrTail) {
+/**
+ * 退出码 + stderr → 错误分类。worker 的约定在 portal_stream.py 文件头。
+ * **导出只为测试**（`test/portal-error.test.mjs`），别在别处当公共 API 用。
+ */
+export function classify(code, stderrTail) {
   const tail = String(stderrTail ?? '');
+  /**
+   * **先判"没有图形会话"**（#68）。worker 里 `gi` 抛未捕获异常时 python 也是退 1，
+   * 跟"缺依赖"撞在同一个码上，但两句提示完全相反：一个是"去装包"，一个是"装了也没用"。
+   *
+   * 特征都是实测到的原文：
+   *   `gi.repository.GLib.GError: Cannot autolaunch D-Bus without X11 $DISPLAY (0)`
+   *   （proot / 容器 / SSH 无图形环境）
+   * 这条要排在 `code === 1` 前面，否则永远进不来。
+   */
+  if (/autolaunch D-Bus|without X11 \$DISPLAY|cannot open display|Unable to init server|XDG_RUNTIME_DIR.{0,24}not set/i
+    .test(tail)) {
+    return 'no-desktop-session';
+  }
   if (code === 1 || /python3-gi|gst-inspect|pipewiresrc|module named 'gi'/i.test(tail)) {
     return 'dependency-missing';
   }
