@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Fixed — portal 采集失败要分清「没装包」和「这台机器没有图形会话」（#68）
+
+proot / 容器 / SSH 无图形环境里，`gi` 抛 `Cannot autolaunch D-Bus without X11 $DISPLAY`
+时 python 退 1，而 `classify()` 把 `code === 1` **无条件**归成 `dependency-missing` ——
+提示永远是「去 sudo apt install python3-gi ...」，人家那些包全装齐了。
+
+- 新增分类 `no-desktop-session`，特征串**排在 `code === 1` 之前**判（`autolaunch D-Bus` /
+  `without X11 $DISPLAY` / `cannot open display` / `Unable to init server` /
+  `XDG_RUNTIME_DIR ... not set`）。
+- 提示直说「装包解决不了，该装的你已经装了」，并给三条真能走的路：换有桌面的会话、
+  `source:"file"` 看本地视频、手机端 see-on-phone。
+- `test/portal-error.test.mjs` 5 条，其中两条是防回归的：真缺依赖时仍是 `dependency-missing`、
+  `code 1 + 空 stderr` 保持老行为（没证据就不改口）。
+
+### Docs — 合入 #67 的「子代理上下文治理」实测，并补了读定位
+
+`yan9690` 的 PR，纯文档。记了三种投递方式的实测成本（parent ≈1 毛 2 / caller ≈2.8 分 /
+切断继承 ≈7 厘），以及一条反直觉数据：图片 1280→800 体积降 47%、token 只降 1.5%。
+
+合进来时在开头补了一段**读定位**：它比的是子代理三种方式**之间**哪个便宜，
+不是「用子代理比主模型自己看便宜」—— 后者差两个数量级（见下一条 "Docs — 说清派子代理"）。
+
 ### Docs — 说清「派子代理去看」是可选项，不是主路径
 
 宿主有 `subagent`，模型可以让它去调 `see_now`、只读它回来的文字。这条路能走，但**贵得离谱**：
