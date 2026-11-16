@@ -2,6 +2,39 @@
 
 ## [Unreleased]
 
+### Fixed — 用户在 DSH 会话里说话，也算「人在」（#69）
+
+循环原来只盯悬浮窗那条 `chat.jsonl`：用户切到 DSH 主聊天窗跟 agent 聊十几分钟，
+它一个字都看不见，照样按「连续 8 次叫醒没人理」收工 —— 采集停了，人明明还在看，
+agent 却被反复空叫醒。
+
+- `index.js` 的 `session/event` 钩子里认人类消息（`type === 'user/message'` 且
+  `source.kind === 'user'` / `'action-cards'`），只认循环绑定的那个会话，命中就
+  `loop.noteUserSpoke()` → `lastUserAt` / `wakesSinceUser` 一起归零。
+- **判据必须看 `source.kind`**：插件自己的叫醒带的是 `{ kind: 'see-now' }`
+  （`timer.js` 的 `userMessage()`）。把自己投的提词当成"人说话了"，那条兜底线
+  就永远不触发 —— 比不修更糟。
+- `shouldGoIdle` 拆出 `idleReason()`（`wake-unanswered` / `idle-silent` / null），
+  `status` 的「只听」那行现在写得出**为什么**停（#69 第 5 条：只有"688s 前停的"
+  这种话，用户和模型都查不出是谁判的）。
+- `test/loop.test.mjs` 两条防回归：说了话就不停 / 没说话照样停在 `idle`。
+
+### Fixed — mac 上能打字、能双指滚、候选框不被压住；滚动底板不再逐格重建（#70 #71）
+
+改动在上游 `dsh-watch-together` 的 `examples/floating-chat/window.py`，包内是
+`sync-window.mjs` 的产物。
+
+- **打不进字**：aqua 上 `overrideredirect(True)` 拿到的不是 key window，操作系统
+  不送键盘事件。Tk 9 删了 `::tk::unsupported::MacWindowStyle`，所以 macOS 上保留
+  系统标题栏（代价是顶部多一条系统栏）。
+- **触控板不滚**：Tk 9 在 mac 上拆出了 `<TouchpadScroll>`，`%D` 是
+  `dx<<16 | dy`（有符号像素增量、~60Hz）。按 `::tk::PreciseScrollDeltas` 解包，
+  攒够 32px 滚一格。Tk 8.6 没这个事件类型，bind 失败就保持只有滚轮。
+- **候选框被压住**：输入框有焦点期间跳过 `_keep_on_top()` 并撤掉 topmost，
+  失焦恢复（只对 mac）。
+- **滚动性能**：底板重建推迟到停手 200ms 之后，滚动期间只重画气泡
+  （社区实测底板 11~12ms/次、单格 45~60ms）。
+
 ### Fixed — portal 采集失败要分清「没装包」和「这台机器没有图形会话」（#68）
 
 proot / 容器 / SSH 无图形环境里，`gi` 抛 `Cannot autolaunch D-Bus without X11 $DISPLAY`

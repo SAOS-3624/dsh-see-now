@@ -311,7 +311,14 @@ function tierLine(hist, src) {
 
 function loopLine(lp) {
   if (!lp) return '没起（还没调过 watch）';
-  if (lp.mode === 'listen') return '只听（采集已停，窗口里的输入还收得到；要看就调 peek）';
+  if (lp.mode === 'listen') {
+    // 判据说不清就等于没说（#69 第 5 条）：`wake-unanswered` 和 `idle-silent`
+    // 的处理方式完全不同 —— 一个是"它叫了你 8 次"，一个是"你好久没开窗"。
+    const why = lp.listenReason === 'wake-unanswered' ? '连续叫醒没人理'
+      : lp.listenReason === 'idle-silent' ? '没开窗 + 一阵没说话'
+        : null;
+    return `只听（采集已停${why ? ` —— ${why}` : ''}；窗口里的输入还收得到，要看就调 peek）`;
+  }
   if (lp.stopped) return lp.reason ? `已停（${lp.reason}）` : '已停';
   const fail = lp.wakeFailures ? `，失败 ${lp.wakeFailures} 次` : '';
   const last = lp.lastWakeAt
@@ -862,6 +869,8 @@ async function registerAll(ctx) {
    * 但**变了不说**更糟：模型会拿一块区域的画面去回答整屏的问题。
    */
   let lastRegionKey = regionText(loadRegion());
+  /** 正在跑的常驻循环（同一时刻只有一个）。声明在 `session/event` 钩子之前 —— 钩子里要读它 */
+  let loop = null;
 
   /**
    * 把模型的**正文**也记进小窗那条流。
@@ -901,6 +910,26 @@ async function registerAll(ctx) {
         const id = session?.header?.id ?? session?.id;
         if (id) lastSessionId = id;
         mirrorAssistantText(event);
+        /**
+         * **用户在会话里说话 = 人在**（#69）。
+         *
+         * 循环原来只盯悬浮窗那条 `chat.jsonl`：用户切到 DSH 主聊天窗跟 agent 聊十几分钟，
+         * 它一个字都看不见，照样按「连续 N 次叫醒没人理」收工 —— 采集停了，人还在看，
+         * agent 却继续被空叫醒。
+         *
+         * 判据只认 `source.kind === 'user'`：宿主 UI 发的消息是
+         * `createUserMessage({ source: { kind: 'user' } })`（ACP bridge），
+         * 而插件自己的叫醒带的是 `{ kind: 'see-now' }`（`timer.js` 的 `userMessage()`）——
+         * 把自己投的提词当成"人说话了"，`wakesSinceUser` 就永远归零，那条兜底线等于没有。
+         * `action-cards` 是用户点了卡片按钮，按人类活动算。
+         *
+         * 只认循环绑定的那个会话（`state().session`）：别的会话里的对话不该续命。
+         */
+        const kind = event?.data?.source?.kind;
+        if (event?.type === 'user/message' && (kind === 'user' || kind === 'action-cards')
+          && id && id === loop?.state?.().session) {
+          loop.noteUserSpoke();
+        }
       });
       if (typeof off === 'function') disposers.push(off);
     } catch (e) {
@@ -909,8 +938,6 @@ async function registerAll(ctx) {
     }
   }
 
-  /** 正在跑的常驻循环（同一时刻只有一个） */
-  let loop = null;
   /** `/seenow` 是否真的注册上了（给 `status` 报出来 —— 用户问"打了 / 怎么没有它"时第一眼看这个） */
   let commandRegistered = false;
   const stopLoop = (reason = '手动') => {

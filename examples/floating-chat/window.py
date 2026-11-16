@@ -49,6 +49,9 @@ from pathlib import Path
 # `AttributeError: module 'ctypes' has no attribute 'windll'`，而且死在依赖预检
 # 之前，用户看到的是"启动后 700ms 退出，code=1"（issue #40）。
 IS_WIN = os.name == "nt"
+# 是不是 macOS。aqua 上有一整套和 Windows 不一样的行为，**不能拿"不是 Windows"来代替**：
+# 无边框窗收不到键盘、触控板走独立事件、输入法候选框是普通窗口层（#70 三条）。
+IS_MAC = sys.platform == "darwin"
 
 # 窗口扩展样式：`noActivate` 用它（点窗不激活，见 `_apply_no_activate`）
 GWL_EXSTYLE = -20
@@ -154,6 +157,13 @@ INTERVAL_MS = max(4, int(1000 / MAX_FPS))
 # 静止画面下「有没有变」只能靠抓屏看，单次 grab ~7ms；空转按 60fps 就是 40% 单核。
 # 降到 30fps 探针，有变化时 idle 立刻归零、下一拍恢复全速。
 PROBE_FPS = 30
+
+# mac 触控板：`<TouchpadScroll>` 一次只给几个像素（~60Hz），攒够这么多才滚一行。
+# 32 是社区实测的结果（#70 第 2 条）：小于它一次滑动要等太久，大于它一格跳得太狠。
+TOUCHPAD_ROW_PX = 32
+# 滚动时把静态底板的**重建**推到停手之后这么久（#71）。底板一次 11~12ms，
+# 每滚一格都重建会让单格 45~60ms；推到停手后，滚动期间只重画气泡。
+STATIC_DEFER_MS = 200
 
 # 仅用于文档截图/CI 视觉检查：暂停抓屏并把 WDA 关掉，窗口才会出现在截图里
 PREVIEW = os.environ.get("DSH_GLASS_PREVIEW") == "1"
@@ -566,7 +576,15 @@ class LiveGlass:
 
         self.root = tk.Tk()
         self.root.withdraw()
-        self.root.overrideredirect(True)
+        # **macOS 上不能 overrideredirect**：aqua 里这样得到的不是一个 key window，
+        # 操作系统压根不往这个进程送键盘事件 —— 点输入区光标画得出来，敲键盘一个字
+        # 都不进（#70 第 1 条，用户探针实测 root/entry 的 <KeyPress> 0 条）。
+        # Tk 8.6 时代的老解法 `::tk::unsupported::MacWindowStyle style plain none`
+        # 在 Tk 9 里被整个删掉了（`invalid command name`），没有等价的 Tcl 入口。
+        # 所以留着系统标题栏：普通窗口能成为 key window，输入立刻可用 ——
+        # 视觉上多一条系统栏，但"打不进字"是硬伤，这个取舍只能这么取。
+        if not IS_MAC:
+            self.root.overrideredirect(True)
         self.root.title(self.name)
         self.root.attributes("-topmost", True)
         self.root.configure(bg=KEY)
@@ -620,6 +638,13 @@ class LiveGlass:
         self._drag = None
         self._resize = None
         self._preview_at = 0.0
+        # 触控板滚动的余量（像素）。mac 的 <TouchpadScroll> 每次只给几个像素、60Hz 一次，
+        # 攒够一行才滚 —— 见 `_touchpad_scroll`（#70 第 2 条）。
+        self._scroll_acc = 0
+        # 输入框有没有焦点。mac 上「正在输入」要撤掉 topmost，否则输入法候选框被压住（#70 第 3 条）。
+        self._ime_focus = False
+        # 滚动时底板重建的 after id（#71，见 `_schedule_static_frame`）
+        self._static_job = None
         # Entry 的真光标被关掉（insertwidth=0），画面上那条线是自己画的，
         # 所以闪烁也得自己来。_caret_job 存 after 的 id，重排时取消，避免叠定时器。
         self._caret_on = True
@@ -826,9 +851,15 @@ class LiveGlass:
             self.root.after(26, lambda: self._intro_step(n + 1))
 
     def _keep_on_top(self) -> None:
-        """DSH 等置顶窗口被激活后会把悬浮窗压下去；定时重新抬到最上层。"""
+        """DSH 等置顶窗口被激活后会把悬浮窗压下去；定时重新抬到最上层。
+
+        **正在输入的时候不抬**（#70 第 3 条）：输入法候选框是普通窗口层，
+        窗口一 topmost 就把它压在底下 —— mac 上用户完全看不见自己在打什么。
+        `_focus_input` 会撤掉 topmost 并置起 `_ime_focus`，失焦（`_on_input_blur`）
+        恢复。只对 mac 生效：Windows 上撤 topmost 会被 DSH 顶下去（#44 第 1 条）。
+        """
         try:
-            if not self._hidden:
+            if not self._hidden and not self._ime_focus:
                 self.root.attributes("-topmost", True)
                 self.root.lift()
         except Exception:
@@ -980,6 +1011,29 @@ class LiveGlass:
             # 连滚只重排最后一次：滚十格就白画九遍（#44 第 2 条，社区实测每格卡 ~1 秒）
             self._schedule_feed_refresh()
 
+    def _touchpad_scroll(self, e):
+        """mac 的触控板：`<MouseWheel>` 根本不来，来的是 `<TouchpadScroll>`（#70 第 2 条）。
+
+        `%D` 的语义也不是 `±120`：高 16 位是 dx，低 16 位是**有符号的 dy（像素增量）**。
+        事件约 60Hz、每次只有几个像素（实测 dy = -4 ~ -8），所以不能"一次事件滚一格" ——
+        攒够 `TOUCHPAD_ROW_PX` 才走一格，余量留着给下一次。解包方式照抄 Tk 自己的
+        `::tk::PreciseScrollDeltas`。方向与 `_wheel` 一致：dy > 0 = 向上 = 看更早的消息。
+        """
+        try:
+            raw = int(e.delta)
+        except (TypeError, ValueError):
+            return
+        low = raw & 0xFFFF
+        dy = low - 0x10000 if low >= 0x8000 else low
+        self._scroll_acc += dy
+        step = int(self._scroll_acc / TOUCHPAD_ROW_PX)
+        if not step:
+            return
+        self._scroll_acc -= step * TOUCHPAD_ROW_PX
+        if self.feed.scroll(step):
+            self._collapse_expanded()
+            self._schedule_feed_refresh()
+
     def _schedule_feed_refresh(self, delay: int = 40) -> None:
         job = getattr(self, "_feed_job", None)
         if job is not None:
@@ -1018,7 +1072,35 @@ class LiveGlass:
         self._draw_scrollbar()
         self.text.refresh()
         if self._geo.shapes != shapes_before:
-            self._sync_static_frame()
+            self._schedule_static_frame()
+
+    def _schedule_static_frame(self) -> None:
+        """把静态底板的重建推到「手停下来之后」（#71）。
+
+        社区实测（macOS / Tk 9.1，issue 里有逐步计时）：底板 `frame_for()` 一次
+        11~12ms，而滚动路径**每滚一格都会换 `_geo.shapes`**，于是每格都重建一张 ——
+        单格 45~60ms，滚动必然掉帧，而且靠调参救不了。
+
+        推迟之后滚动期间只重画气泡，代价是滚动中短暂看到旧底板（形状差一点点），
+        停手 200ms 内就对上了。**语义没变**：`_sync_static_frame()` 本来就按 shapes
+        缓存，形状没变时是 0 成本，所以"多画一次"不亏。
+
+        定时器必须只留一个：连线滚十格，十个 after 一起醒来等于把省下的又还回去。
+        """
+        job = getattr(self, "_static_job", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        try:
+            self._static_job = self.root.after(STATIC_DEFER_MS, self._run_static_frame)
+        except Exception:
+            self._static_job = None
+
+    def _run_static_frame(self) -> None:
+        self._static_job = None
+        self._sync_static_frame()
 
     def _toggle_mic(self):
         if self._mic_proc is not None and self._mic_proc.poll() is None:
@@ -1163,12 +1245,31 @@ class LiveGlass:
         # 理由见 `_apply_no_activate`。
         if getattr(self, "_no_activate_on", False):
             self._apply_no_activate(False)
+        # mac：**输入期间必须撤 topmost**，否则输入法候选框被压在窗口底下看不见（#70 第 3 条）。
+        # 只对 mac 生效 —— Windows 上撤了会被 DSH 顶下去（#44 第 1 条），而那边候选框
+        # 是独立浮层，不受 topmost 影响。
+        if IS_MAC and not self._ime_focus:
+            self._ime_focus = True
+            try:
+                self.root.attributes("-topmost", False)
+            except Exception:
+                pass
         try:
             self._entry.focus_force()
             self._entry.icursor("end")
         except Exception:
             pass
         self._caret_on = True
+        self._render_input()
+
+    def _on_input_blur(self, _e=None):
+        """输入框失焦：重画光标 + 把 topmost 还回去（mac，见 `_focus_input`）。"""
+        if IS_MAC and self._ime_focus:
+            self._ime_focus = False
+            try:
+                self.root.attributes("-topmost", True)
+            except Exception:
+                pass
         self._render_input()
 
     # ---- 改名 ----
@@ -1595,7 +1696,7 @@ class LiveGlass:
         self._entry.bind("<KeyRelease>", self._on_input_key)
         self._entry.bind("<Return>", self._send)
         self._entry.bind("<FocusIn>", lambda _e: self._render_input())
-        self._entry.bind("<FocusOut>", lambda _e: self._render_input())
+        self._entry.bind("<FocusOut>", self._on_input_blur)
         # 插入点还能被鼠标和选择改动，这些不发 KeyRelease：不补这几个，点一下
         # 输入框中间，画面上的光标就跟不过去。after_idle 等 Entry 自己先处理完。
         for seq in ("<ButtonRelease-1>", "<B1-Motion>", "<<Selection>>"):
@@ -2293,6 +2394,14 @@ class LiveGlass:
     def run(self):
         self.root.bind("<Escape>", self._close)
         self.root.bind("<MouseWheel>", self._wheel)
+        # **mac 触控板不走 <MouseWheel>**：Tk 9 把它拆成了独立的 <TouchpadScroll>
+        # （tk.h: `MappingNotify + 5`）。Tk 8.6 没有这个事件类型，bind 会当场抛
+        # `bad event type or keysym`，所以只在 mac 上试，失败就保持"只有滚轮"。
+        if IS_MAC:
+            try:
+                self.root.bind("<TouchpadScroll>", self._touchpad_scroll)
+            except tk.TclError:
+                pass
         self.root.bind("<Motion>", self._hover, add="+")
         self.root.bind("<Leave>", self._leave, add="+")
         self.root.bind("<ButtonPress-1>", self._press, add="+")

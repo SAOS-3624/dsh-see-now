@@ -318,3 +318,54 @@ test('节奏：spoken 记下上一句时长；有声音适配器时 due 不算',
     speech.__resetSpeech();
   }
 });
+
+// ---- #69：用户在主会话说话，也要算「人在」----
+//
+// 循环原来只盯悬浮窗那条 `chat.jsonl`：用户切到 DSH 主聊天窗跟 agent 聊天，
+// 它一个字都看不见，照样按「连续 N 次叫醒没人理」收工 —— 采集停了，人还在看。
+// `noteUserSpoke()` 的调用点在 `index.js` 的 `session/event` 钩子（只认
+// `source.kind === 'user'`；插件自己的叫醒带的是 `'see-now'`）。
+
+test('用户在会话里说话 → 「连续叫醒没人理」清零，不因为叫够了就收工（#69）', async () => {
+  __resetInterject();
+  const { ctx, wakes } = fakeCtx();
+  const runner = seqRunner({ sheets: 1, pending: 1 });
+  // idleStopMs: 0 关掉"多久没说话"那条，只留叫醒上限这一条
+  const loop = startLoop({
+    ctx, sessionId: 's1', runner, wakeMinGapSec: 0,
+    tuning: { maxAutonomousWakes: 1, idleStopMs: 0, wakeBatch: 1 },
+  });
+
+  await sleep(300);
+  assert.equal(wakes.length, 1, `应该先叫醒一次，实际 ${wakes.length}`);
+  loop.noteActivity();
+
+  // 用户在主聊天窗说话了（钩子会把这一下打进来）
+  loop.noteUserSpoke();
+  runner.st.sheets = 2;        // 又出一张，让它有理由继续
+  await sleep(2400);
+  loop.dispose();
+
+  assert.equal(loop.stopped(), false, '用户刚说过话，不该判「没人理」收工');
+  assert.equal(loop.state().mode, 'active');
+});
+
+test('没有 noteUserSpoke 时，叫够 maxAutonomousWakes 就该停（同一条线没被改坏）', async () => {
+  __resetInterject();
+  const { ctx } = fakeCtx();
+  const runner = seqRunner({ sheets: 1, pending: 1 });
+  const loop = startLoop({
+    ctx, sessionId: 's1', runner, wakeMinGapSec: 0,
+    tuning: { maxAutonomousWakes: 1, idleStopMs: 0, wakeBatch: 1 },
+  });
+
+  await sleep(300);
+  loop.noteActivity();         // 模型接住了，但**用户一句话没说**
+  await sleep(2400);
+  const st = loop.state();
+  loop.dispose();
+
+  // 窗没开（DSH_SEE_NO_WINDOW=1）→ idleAction 给 'stop'
+  assert.equal(st.stopped, true, '没人说话就该收工，这条兜底线不能被新逻辑吃掉');
+  assert.equal(st.reason, 'idle');
+});

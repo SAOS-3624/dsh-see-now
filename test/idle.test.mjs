@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { shouldGoIdle, IDLE_STOP_MS, MAX_AUTONOMOUS_WAKES } from '../src/loop.js';
+import { idleReason, shouldGoIdle, IDLE_STOP_MS, MAX_AUTONOMOUS_WAKES } from '../src/loop.js';
 
 /**
  * 回归：社区实报「装上后会卡读图循环」。
@@ -42,4 +42,22 @@ test('idle 之后：窗开着只降级成"只听"，窗关掉才真收工', () =
     '窗还在屏幕上，用户随时会打字 —— 不能把耳朵一起拆掉');
   assert.equal(idleAction({ idle: true, windowOpen: false }), 'stop');
   assert.equal(idleAction({}), 'continue');
+});
+
+// ---- #69：`status` 必须说得出「为什么停」，两条线的原因不能糊成一个 ----
+test('idleReason: 两条线各自报得出原因，没判到就是 null', () => {
+  assert.equal(idleReason({ wakesSinceUser: 1, now: NOW, lastUserAt: NOW, windowOpen: true }), null);
+
+  assert.equal(
+    idleReason({ wakesSinceUser: MAX_AUTONOMOUS_WAKES, now: NOW, lastUserAt: NOW, windowOpen: true }),
+    'wake-unanswered', '叫了 N 次没人理 —— 和"没开窗久了"是两件事');
+
+  assert.equal(
+    idleReason({ wakesSinceUser: 1, now: NOW, lastUserAt: NOW - IDLE_STOP_MS - 1, windowOpen: false }),
+    'idle-silent', '没开窗 + 一阵没说话');
+
+  // 两条同时成立时先报叫醒那条（它更"主动"，用户更容易对上号）
+  assert.equal(
+    idleReason({ wakesSinceUser: 99, now: NOW, lastUserAt: 0, windowOpen: false }),
+    'wake-unanswered');
 });

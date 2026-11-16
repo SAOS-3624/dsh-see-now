@@ -61,10 +61,13 @@ export const IDLE_STOP_MS = 3 * 60 * 1000;
 export const MAX_AUTONOMOUS_WAKES = 8;
 
 /**
- * 该不该因为「没人在看」收工 —— 抽成纯函数，好测也好读。
+ * 该不该因为「没人在看」收工 —— 返回**原因**，null = 还想继续陪着。
  *
  * 社区实报「装上后卡读图循环」：常驻循环原来**只有"采集停了"一个退出条件**，
  * 屏幕一直动（放视频、刷网页）就会每 15 秒叫醒模型一次，永远不停。
+ *
+ * 返回原因而不是布尔值，是因为 `status` 必须说得清"为什么停了"——
+ * 只有 `没在采集（688s 前停的）` 这种话，用户和模型都查不出是谁判的（#69 第 5 条）。
  */
 /**
  * 判到 idle 之后该干什么。
@@ -79,17 +82,22 @@ export function idleAction({ idle = false, windowOpen = false } = {}) {
   return windowOpen ? 'listen' : 'stop';
 }
 
-export function shouldGoIdle({
+export function idleReason({
   wakesSinceUser = 0, now = Date.now(), lastUserAt = now, windowOpen = false,
   maxWakes = MAX_AUTONOMOUS_WAKES, idleStopMs = IDLE_STOP_MS,
 } = {}) {
   // 两条线都能由 ~/.dsh/see-now.json 覆盖（#8）：写死的 8 次在悬浮窗开着时
   // 就是实际的最长陪看时长，想陪久一点的人只能改源码。
-  if (maxWakes > 0 && wakesSinceUser >= maxWakes) return true;
+  if (maxWakes > 0 && wakesSinceUser >= maxWakes) return 'wake-unanswered';
   // 悬浮窗开着 = 有人在陪看，中途不说话是正常的，只靠"叫太多次"兜底
   // idleStopMs <= 0 = 用户主动关掉这条（愿意一直陪着）
-  if (!windowOpen && idleStopMs > 0 && now - lastUserAt > idleStopMs) return true;
-  return false;
+  if (!windowOpen && idleStopMs > 0 && now - lastUserAt > idleStopMs) return 'idle-silent';
+  return null;
+}
+
+/** `idleReason()` 的布尔版（老调用点 / 测试用的都是它）。 */
+export function shouldGoIdle(opts) {
+  return idleReason(opts) !== null;
 }
 
 /**
@@ -263,12 +271,15 @@ export function startLoop({
    * 却会被下面 ② 判成 `capture-stopped`，于是用户刚说一句话，循环整个收工。
    */
   let pausedByListen = false;
+  /** 为什么进只听模式（`idleReason()` 的返回值）—— 只给 `status` 用，别让用户猜 */
+  let listenReason = null;
 
-  const enterListen = () => {
+  const enterListen = (why = null) => {
     if (mode === 'listen' || disposed) return;
     mode = 'listen';
+    listenReason = why;
     pausedByListen = true;
-    log('进入只听模式：停止采集，但继续盯着窗口里的输入');
+    log(`进入只听模式：停止采集，但继续盯着窗口里的输入（${why ?? '原因未知'}）`);
     try { runner.stop(); } catch { /* 已经停了 */ }
     try {
       appendSpoken('meta', '（有一阵没人说话了，我先停一停 —— 你在这儿打字我还能看见，说一声就继续看。）', { speak: false });
@@ -446,15 +457,13 @@ export function startLoop({
       //      **但窗还开着的时候只降级、不收工** —— 那扇窗还在屏幕上，用户随时可能打字，
       //      把循环整个拆掉等于把他的输入扔进黑洞（见 mode 的说明）。
       const winOpenNow = windowAlive();
-      const act = idleAction({
-        idle: shouldGoIdle({
-          wakesSinceUser, lastUserAt, windowOpen: winOpenNow,
-          maxWakes: tuning?.maxAutonomousWakes,
-          idleStopMs: tuning?.idleStopMs,
-        }),
-        windowOpen: winOpenNow,
+      const why = idleReason({
+        wakesSinceUser, lastUserAt, windowOpen: winOpenNow,
+        maxWakes: tuning?.maxAutonomousWakes,
+        idleStopMs: tuning?.idleStopMs,
       });
-      if (act === 'listen') { enterListen(); return; }
+      const act = idleAction({ idle: why !== null, windowOpen: winOpenNow });
+      if (act === 'listen') { enterListen(why); return; }
       if (act === 'stop') { stop('idle'); return; }
 
       // ⑤ 攒够一张**新的**图了 —— 这才是常态唤醒。
@@ -548,11 +557,27 @@ export function startLoop({
     dispose,
     /** 任何一次 `see_now` 调用都算"接住了上一条叫醒"。 */
     noteActivity() { lastAckAt = Date.now(); },
+    /**
+     * **用户在会话里说话了** —— 和"在悬浮窗里打字"同样算「人在」。
+     *
+     * #69：循环原来只盯悬浮窗那条 `chat.jsonl`，用户在 DSH 主聊天窗跟 agent 聊了
+     * 十几分钟，它一个都看不见，照样按「连续 8 次叫醒没人理」收工 —— 采集停了、
+     * agent 被反复叫醒却没有画面，而人明明就坐在那儿。
+     *
+     * 调用点在 `index.js` 的 `session/event` 钩子里（只认 `source.kind === 'user'`
+     * 的人类消息，插件自己的叫醒带的是 `'see-now'`，不能算）。
+     */
+    noteUserSpoke() {
+      lastUserAt = Date.now();
+      wakesSinceUser = 0;
+    },
     stopped: () => stopReason !== null,
     state: () => ({
       stopped: stopReason !== null,
       // 'active' 在正常看；'listen' = 只剩耳朵（采集停了，但窗里打字仍然收得到）
       mode,
+      // 只给 'listen' 用：'wake-unanswered' / 'idle-silent'，null = 原因不明（老路径）
+      listenReason,
       reason: stopReason,
       session: owner,
       wakes: wakeCount,
