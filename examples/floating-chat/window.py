@@ -1467,6 +1467,15 @@ class LiveGlass:
         except Exception:
             self._hidden = False
             return
+        # **抓屏线程必须一起停**（社区实报 2026-11-16）。
+        #
+        # `withdraw()` 只是把窗口从屏幕上拿走 —— `mss` 照样每帧抓整屏、再跑一遍模糊，
+        # 用户看到的是"窗口关掉状态、CPU 却满载"（实测 4 秒墙钟吃掉 5 秒 CPU 时间）。
+        # 他说的"关"是三件事：指示灯灭、预览停、**CPU 落回 0**。只做第一件的话，
+        # 后两件会安静地开着 —— 这正是"被装上摄像头"的感觉来源。
+        #
+        # 放在 withdraw 之后：先让窗口消失，再花那 0.4s 的 join，用户感知不到卡。
+        self._stop_worker()
         if self._tray is not None:
             self._tray.show()
             # 每次运行只提示一次：Windows 11 会把新图标塞进溢出区，不告诉用户
@@ -1488,6 +1497,9 @@ class LiveGlass:
             pass
         if self._tray is not None:
             self._tray.hide()
+        # 回来要把抓屏线程重新拉起来 —— `_start_worker()` 会重建 CaptureSource；
+        # 静态样式（solid / frost）下它自己会 return，不需要在这里分情况。
+        self._start_worker()
         self._mark_read()
 
     def _sync_danmaku(self, cfg=None) -> None:
@@ -2115,7 +2127,10 @@ class LiveGlass:
         idle = 0
         with mss.mss() as sct:
             while not stop.is_set() and not self._stop.is_set():
-                if self._pause.is_set() or self._collapsed:
+                # `_hidden` 是**第三道闸**：正常路径上 `_minimize()` 会直接 `_stop_worker()`
+                # 把线程杀掉，这里再判一次是防别的路径设了 `_hidden` 却没停线程
+                # （状态位说"关了"、CPU 还在烧，正是社区报的那种假关）。
+                if self._pause.is_set() or self._collapsed or self._hidden:
                     time.sleep(0.03)
                     continue
                 t0 = time.perf_counter()
