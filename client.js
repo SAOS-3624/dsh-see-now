@@ -162,6 +162,7 @@ window.__ModuleLoader__.load({
       'field.pollMs.hint': '单位毫秒。这个不是转写的开销，主要成本是等断句。',
       'hint.restart': '改这里不会当场生效：这些值决定的是循环的收工线和断句节奏，插件在启动时读一次。保存后重开 DSH。',
       'hint.path': '配置文件',
+      'hint.trust.replica': '信任判据走的是备用那一条：内核自己的准入检查抛了错，现在按 Host / Origin / 跨站来判。不影响使用，但这层本该由内核负责。',
       'hint.origin': '这里显示的默认值直接来自插件源码，不是在界面里另写一套。',
       'warn.title': '配置里有几处它没接受，用的是默认值',
       'err.rejected': '这几项没通过校验，文件没有被改动：',
@@ -670,7 +671,18 @@ window.__ModuleLoader__.load({
         h('div', { className: 'sn_hero' },
           h('h2', { className: 'sn_title' }, t('title')),
           h('p', { className: 'sn_sub' }, t('sub')),
-          h('div', { className: 'sn_mono' }, `${t('hint.path')}：${data.path}`)),
+          h('div', { className: 'sn_mono' }, `${t('hint.path')}：${data.path}`),
+          /*
+           * 现在站的是哪条闸。
+           *
+           * 降级是静默发生的——不显示的话，内核哪天坏透了我们也不会知道，只会一直
+           * 用着备用的那条路并丢掉内核那层会话认证。平时不占地方，降级时才出现。
+           */
+          data.trust?.path === 'replica'
+            ? h('div', { className: 'sn_mono', style: { opacity: 0.7 } },
+              t('hint.trust.replica'),
+              data.trust.degraded ? `（${data.trust.degraded}）` : '')
+            : null),
 
         data.warnings.length > 0
           ? h('div', { className: 'sn_box warn', role: 'status' },

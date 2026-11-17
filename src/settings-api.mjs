@@ -22,7 +22,7 @@
  * @module src/settings-api.mjs
  */
 
-import { rejectionFor } from './settings-trust.js';
+import { assessRequest } from './settings-trust.js';
 import { asrPath, readAsrConfig, writeAsrConfig } from './asr-store.mjs';
 import { readWindowStyle, setWindowStyle, setWindowHidden, setWindowDanmaku } from './window.js';
 import {
@@ -38,6 +38,40 @@ import {
 
 /** 与 `client.js` 里的 `API` 常量必须一致。 */
 export const ROUTE_PREFIX = '/api/see-now';
+
+/**
+ * 降级只报一次日志。
+ *
+ * 挂在这里而不是 `createSettingsApi` 里面：`/status` 会被面板反复调用，逐条写
+ * 只会把那句话淹掉，反而看不见。
+ */
+let degradedLogged = false;
+
+/**
+ * 现在站的是哪条闸。
+ *
+ * `kernel` 是内核自己的准入，`replica` 是内核抛错时退的那条复刻判据。降级是
+ * **静默**发生的，所以必须有地方说出来：它是应急通道，不该悄悄变成常走的路。
+ * 内核哪天修好，这里会自己变回 `kernel`，不需要谁记得回来改代码。
+ */
+function trustOf(verdict) {
+  if (verdict.degraded === undefined) return { path: 'kernel' };
+  return { path: 'replica', degraded: verdict.degraded };
+}
+
+/** 拒绝时给用户看的话：每一句都指向「该去查什么」。 */
+const TRUST_HINTS = {
+  'kernel-401': '内核要求先完成浏览器认证：这个窗口的会话没被认出来，重开设置页或重连一次',
+  'kernel-403': '内核不认这个来源：Host 不是 loopback，或 Origin / Sec-Fetch-Site 显示跨站',
+  'no-host': '请求里没有 Host 头',
+  'host-not-loopback': 'Host 不是 loopback 地址',
+  'cross-site': 'Sec-Fetch-Site 是 cross-site',
+  'origin-invalid': 'Origin 解析不出 http(s)',
+  'origin-mismatch': 'Origin 与 Host 不同源',
+  'referer-invalid': 'Referer 解析不出 http(s)',
+  'referer-mismatch': 'Referer 与 Host 不同源',
+  'desktop-relay-with-origin': '同时带了 Origin 与 dsh-app 转发的 Referer，两者互相矛盾',
+};
 
 /** 面板提交的 JSON 不该有大请求体；给足富余但仍设上限。 */
 const BODY_LIMIT = 32 << 10;
@@ -127,9 +161,19 @@ export function createSettingsApi({ logger } = {}) {
 
   return async function handle(req, res, connection) {
     // 第一件事永远是过信任栅栏：前缀比内核 `/api` 长，这些请求没经过内核准入。
-    const rejection = rejectionFor(req, connection);
-    if (rejection !== undefined) {
-      send(res, rejection, { ok: false, rejected: ['请求不被信任'] });
+    const verdict = assessRequest(req, connection);
+    if (verdict.degraded !== undefined && !degradedLogged) {
+      degradedLogged = true;
+      // 只报一次：降级之后每个请求都会走到这里，逐条写日志只会把它淹掉。
+      log(`see-now: 内核准入自己抛了错，改走复刻判据 —— ${verdict.degraded}`);
+    }
+    if (!verdict.ok) {
+      send(res, verdict.status, {
+        ok: false,
+        rejected: [TRUST_HINTS[verdict.code] ?? '请求不被信任'],
+        code: verdict.code,
+        ...(verdict.detail === undefined ? {} : { detail: verdict.detail }),
+      });
       return;
     }
 
@@ -159,6 +203,8 @@ export function createSettingsApi({ logger } = {}) {
           paces: PACES_KEYS,
           writable: { keys: WRITABLE_KEYS, listen: WRITABLE_LISTEN_KEYS },
           local: localPayload(),
+          // 现在站的是哪条闸：kernel（内核）或 replica（内核抛错时退的复刻判据）
+          trust: trustOf(verdict),
           // 悬浮窗样式在另一个文件（watch-window.json），和上面那套互不影响
           window: readWindowStyle(),
           warnings: tuning.warnings,

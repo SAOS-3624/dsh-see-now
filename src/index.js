@@ -555,27 +555,36 @@ function installSettings(ctx, log) {
     }
     const handle = createSettingsApi({ logger: ctx?.logger });
     ctx.inject(['webServer'], (scoped) => {
+      /*
+       * `connection` 自己声明一次，而不是每次请求 `scoped.get('connection')`。
+       *
+       * cordis 的服务是 Proxy：`get()` 拿到的只是代理，注入声明要等**真正访问属性**时
+       * 才检查，于是异常从 `admit()` 内部冒出来，被我们的 catch 归成 503 —— 看起来像
+       * 「内核准入自己坏了」，其实是一路捞到那里才发现少声明。
+       *
+       * 用内层 inject 而不是把 `connection` 加进外层数组：它是可选服务，硬依赖会让
+       * 没有它的部署连设置路由都不注册。没就绪时保持 undefined，请求退回复刻栅栏
+       * （按 Host / Origin 判定），仍然安全。
+       *
+       * 但声明到这里只解决我们这一侧。`admit()` 内部还要读 `connection` fiber 里的
+       * `authentication`，那一条插件改不了 —— 见 `settings-trust.js` 的降级路径。
+       */
+      let connection;
+      scoped.inject(['connection'], (withConnection) => {
+        connection = withConnection.connection;
+      });
       scoped.effect(
         () =>
           scoped.webServer.register({
             kind: 'prefix',
             path: ROUTE_PREFIX,
-            handler: (req, res) => handle(req, res, readConnection(scoped)),
+            handler: (req, res) => handle(req, res, connection),
           }),
         'dsh-see-now: settings routes',
       );
     });
   } catch (e) {
     log(`设置页接口没挂上：${e?.message ?? e}`);
-  }
-}
-
-/** 每次请求现取 `connection`：它同样晚挂载，缓存会缓存到 undefined。 */
-function readConnection(scoped) {
-  try {
-    return scoped.get('connection');
-  } catch {
-    return undefined;
   }
 }
 
