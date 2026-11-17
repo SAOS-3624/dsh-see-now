@@ -555,27 +555,36 @@ function installSettings(ctx, log) {
     }
     const handle = createSettingsApi({ logger: ctx?.logger });
     ctx.inject(['webServer'], (scoped) => {
+      /*
+       * 认证交给内核，我们只接结果。
+       *
+       * `webServer` 的 `authPolicy()` 是 `auth ?? "required"`：路由不声明 `auth` 就等于
+       * 要认证。`authorize()` 在调用 handler **之前**跑完准入，拒绝时直接回 401 / 403 /
+       * 503，handler 根本不会进来；成功时把 `peer` 作为第三个参数交过来。
+       *
+       * 曾经这里自己 inject `connection` 再调 `admit()`。`admit()` 内部要读
+       * `this.authentication.authenticate`，而那个 authentication 同样是代理 —— 它按
+       * **求值时的 fiber** 校验注入，所以我们这边怎么 inject 都拿不到。异常冒出后被
+       * catch，退到来源栅栏**并放行**，等于把内核刚做完的身份认证扔掉，换成一个只能
+       * 证明「请求来自本机」的判据。
+       *
+       * 显式写 `auth: 'required'` 而不是靠默认值：默认值是宿主的实现细节，上游改一行
+       * 就能变；写出来才是我们的意图。旧宿主（webServer 只认 kind/path/handler）会忽略
+       * 这个未知字段，那种情况下 `peer` 是 undefined，`settings-trust.js` 退回来源栅栏。
+       */
       scoped.effect(
         () =>
           scoped.webServer.register({
             kind: 'prefix',
             path: ROUTE_PREFIX,
-            handler: (req, res) => handle(req, res, readConnection(scoped)),
+            auth: 'required',
+            handler: (req, res, peer) => handle(req, res, peer),
           }),
         'dsh-see-now: settings routes',
       );
     });
   } catch (e) {
     log(`设置页接口没挂上：${e?.message ?? e}`);
-  }
-}
-
-/** 每次请求现取 `connection`：它同样晚挂载，缓存会缓存到 undefined。 */
-function readConnection(scoped) {
-  try {
-    return scoped.get('connection');
-  } catch {
-    return undefined;
   }
 }
 

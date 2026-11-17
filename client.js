@@ -162,6 +162,7 @@ window.__ModuleLoader__.load({
       'field.pollMs.hint': '单位毫秒。这个不是转写的开销，主要成本是等断句。',
       'hint.restart': '改这里不会当场生效：这些值决定的是循环的收工线和断句节奏，插件在启动时读一次。保存后重开 DSH。',
       'hint.path': '配置文件',
+      'hint.trust.legacy': '这个宿主没有路由认证，设置接口退回来源栅栏判定：只认 Host / Origin / 跨站。能用，但这层本该由内核负责。',
       'hint.origin': '这里显示的默认值直接来自插件源码，不是在界面里另写一套。',
       'warn.title': '配置里有几处它没接受，用的是默认值',
       'err.rejected': '这几项没通过校验，文件没有被改动：',
@@ -670,7 +671,17 @@ window.__ModuleLoader__.load({
         h('div', { className: 'sn_hero' },
           h('h2', { className: 'sn_title' }, t('title')),
           h('p', { className: 'sn_sub' }, t('sub')),
-          h('div', { className: 'sn_mono' }, `${t('hint.path')}：${data.path}`)),
+          h('div', { className: 'sn_mono' }, `${t('hint.path')}：${data.path}`),
+          /*
+           * 现在站的是哪条闸。
+           *
+           * `peer` 是内核认证后交过来的身份，`legacy` 是宿主没有路由认证时退的来源
+           * 栅栏。后者是兜底，但它悄悄发生的时候没人会注意到 —— 显示出来，才知道自己
+           * 正在用一条更弱的判据。平时不占地方，退到兜底时才出现。
+           */
+          data.trust?.path === 'legacy'
+            ? h('div', { className: 'sn_mono', style: { opacity: 0.7 } }, t('hint.trust.legacy'))
+            : null),
 
         data.warnings.length > 0
           ? h('div', { className: 'sn_box warn', role: 'status' },
