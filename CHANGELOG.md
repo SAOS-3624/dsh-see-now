@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Fixed — 设置面板读不到配置：认证交回内核（#73）
+
+社区修复（citydirector）。面板从 #24 合并进主干起，在桌面版里一直是「读不到配置：请求不被信任」。
+根子不在面板：本插件的前缀比内核 `/api` 长，请求不经过内核准入，于是插件自己复刻了一份判据 ——
+而那份复刻把「`Referer: dsh-app://app/` 与 `Sec-Fetch-Site` 同时出现」当成跨站证据。
+Chromium 给同源请求一律加 `Sec-Fetch-Site`，桌面转发又必留那个 Referer，
+于是窗口发出的每一个合法请求都被 403。
+
+- 路由改成声明 `auth: 'required'`：认证由内核做，`peer` 作为 handler 的第三个参数交进来。
+  旧宿主的 `webServer.register()` 只认 `kind`/`path`/`handler`，没有这条机制，
+  `peer` 缺席时才退来源栅栏 —— 而且**失败一律拒绝**，不再「服务自己报错就放行」。
+- 复刻判据对齐内核的 `isTrustedApiRequest()`：只看 Host / `sec-fetch-site` / Origin，**不看 Referer**。
+- `/status` 多一个 `trust.path`（`peer` / `legacy`）。退到兜底时面板上写一行灰字：
+  兜底通道不该悄悄变成常走的路，否则哪天内核修好了也没人发现我们还在用更弱的判据。
+- 新增 `test/settings-trust.test.mjs`（7 项）—— 这个模块此前零测试覆盖，
+  那条过严的判据才能在仓库里躺过两个版本。
+
 ## [0.2.4] - 2026-11-16
 
 > 0.2.3 打过包但**没发到 npm**（registry 上从来没有 0.2.3，用户装到的都是 0.2.2）——
