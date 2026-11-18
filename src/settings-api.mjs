@@ -22,7 +22,7 @@
  * @module src/settings-api.mjs
  */
 
-import { rejectionFor } from './settings-trust.js';
+import { assessRequest } from './settings-trust.js';
 import { asrPath, readAsrConfig, writeAsrConfig } from './asr-store.mjs';
 import { readWindowStyle, setWindowStyle, setWindowHidden, setWindowDanmaku } from './window.js';
 import {
@@ -38,6 +38,36 @@ import {
 
 /** 与 `client.js` 里的 `API` 常量必须一致。 */
 export const ROUTE_PREFIX = '/api/see-now';
+
+/**
+ * 退回来源栅栏这件事只报一次日志。
+ *
+ * 挂在这里而不是 `createSettingsApi` 里面：`/status` 会被面板反复调用，逐条写
+ * 只会把那句话淹掉，反而看不见。
+ */
+let legacyLogged = false;
+
+/**
+ * 现在站的是哪条闸。
+ *
+ * `peer` 是内核认证后交过来的身份，`legacy` 是宿主没有路由认证机制时退的来源栅栏。
+ * 后者是兜底，不该悄悄变成常走的路 —— 所以退到它的时候会记一次日志，也会显示在面板上。
+ */
+function trustOf(verdict) {
+  return { path: verdict.path };
+}
+
+/** 拒绝时给用户看的话：每一句都指向「该去查什么」。 */
+const TRUST_HINTS = {
+  'no-host': '请求里没有 Host 头',
+  'host-not-loopback': 'Host 不是 loopback 地址',
+  'cross-site': 'Sec-Fetch-Site 是 cross-site',
+  'origin-invalid': 'Origin 解析不出 http(s)',
+  'origin-mismatch': 'Origin 与 Host 不同源',
+  'referer-invalid': 'Referer 解析不出 http(s)',
+  'referer-mismatch': 'Referer 与 Host 不同源',
+  'desktop-relay-with-origin': '同时带了 Origin 与 dsh-app 转发的 Referer，两者互相矛盾',
+};
 
 /** 面板提交的 JSON 不该有大请求体；给足富余但仍设上限。 */
 const BODY_LIMIT = 32 << 10;
@@ -125,11 +155,22 @@ export function createSettingsApi({ logger } = {}) {
     return patch;
   }
 
-  return async function handle(req, res, connection) {
-    // 第一件事永远是过信任栅栏：前缀比内核 `/api` 长，这些请求没经过内核准入。
-    const rejection = rejectionFor(req, connection);
-    if (rejection !== undefined) {
-      send(res, rejection, { ok: false, rejected: ['请求不被信任'] });
+  return async function handle(req, res, peer) {
+    // 内核在调用我们之前就做完准入（路由不声明 auth 就等于 required），拒绝时
+    // handler 根本不会进来。所以 `peer` 在这里的身份是「身份已经被回答过」的证据，
+    // 只有它缺席（宿主没有路由认证）时才退到来源栅栏。
+    const verdict = assessRequest(req, peer);
+    if (verdict.path === 'legacy' && !legacyLogged) {
+      legacyLogged = true;
+      // 只报一次：旧宿主上每个请求都会走到这里，逐条写日志只会把它淹掉。
+      log('see-now: 这个宿主没有路由认证，设置接口退回来源栅栏判定');
+    }
+    if (!verdict.ok) {
+      send(res, verdict.status, {
+        ok: false,
+        rejected: [TRUST_HINTS[verdict.code] ?? '请求不被信任'],
+        code: verdict.code,
+      });
       return;
     }
 
@@ -159,6 +200,8 @@ export function createSettingsApi({ logger } = {}) {
           paces: PACES_KEYS,
           writable: { keys: WRITABLE_KEYS, listen: WRITABLE_LISTEN_KEYS },
           local: localPayload(),
+          // 现在站的是哪条闸：peer（内核认证过的身份）或 legacy（宿主没有路由认证时退的来源栅栏）
+          trust: trustOf(verdict),
           // 悬浮窗样式在另一个文件（watch-window.json），和上面那套互不影响
           window: readWindowStyle(),
           warnings: tuning.warnings,
