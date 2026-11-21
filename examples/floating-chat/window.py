@@ -165,6 +165,13 @@ TOUCHPAD_ROW_PX = 32
 # 每滚一格都重建会让单格 45~60ms；推到停手后，滚动期间只重画气泡。
 STATIC_DEFER_MS = 200
 
+TOP_EDGE_PX = 14
+
+CARET_COLOR = "#7cc4ff"
+CARET_W = 2
+CARET_HALF_H = 10
+SEL_FILL = "#2f6fb5"
+
 # 仅用于文档截图/CI 视觉检查：暂停抓屏并把 WDA 关掉，窗口才会出现在截图里
 PREVIEW = os.environ.get("DSH_GLASS_PREVIEW") == "1"
 # 文档截图：正常抓屏 2.5 秒后暂停并取消 WDA，保留最后一帧玻璃
@@ -455,10 +462,42 @@ def danmaku_options(cfg=None) -> dict:
 
 
 def append_user(text: str) -> None:
+    """把用户打的一句话追加进 `chat.jsonl`。
+
+    正常路径就是 append。**EACCES 时退一步自己修**（issue #75）：社区实报
+    `Permission denied: '...chat.jsonl'` —— 同一台机器上 PowerShell 能写、Python 不能，
+    典型的"文件 ACL 坏了 / 被某个带独占语义的进程攥着"。
+
+    修法不是重试 append（同一个句柄还是会被拒），而是**整份读出来 + 新行，写成临时文件
+    再 `os.replace()` 换掉**：新文件的 ACL 由目录继承，坏 ACL 随旧 inode 一起没了。
+    并发追加的风险只在失败路径上（本来这条就写不进去），可以接受。
+    """
     CHAT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(CHAT_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps({"role": "user", "text": text, "at": int(time.time() * 1000)},
-                           ensure_ascii=False) + "\n")
+    line = json.dumps({"role": "user", "text": text, "at": int(time.time() * 1000)},
+                      ensure_ascii=False) + "\n"
+    try:
+        with open(CHAT_FILE, "a", encoding="utf-8") as f:
+            f.write(line)
+        return
+    except PermissionError as exc:
+        first = exc
+    old = ""
+    try:
+        if CHAT_FILE.exists():
+            old = CHAT_FILE.read_text(encoding="utf-8")
+    except OSError:
+        old = ""                      # 读不出来只能丢掉历史，至少别把这一句也丢了
+    tmp = CHAT_FILE.with_name(f"{CHAT_FILE.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(old + line)
+        os.replace(tmp, CHAT_FILE)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise first
 
 
 def asr_python() -> str:
@@ -989,7 +1028,9 @@ class LiveGlass:
         try:
             append_user(text)
         except Exception as exc:
-            self.feed.status = f"写不进去：{exc}"
+            # 字**不清空**：写不进去的时候，用户最需要的就是改完环境再按一次回车。
+            # `append_user` 里已经试过"换掉整份文件"这条路，还失败就真是权限/占用了。
+            self.feed.status = f"写不进去：{exc}（文件被占用或权限不足；关掉多余的窗再试）"
             self._refresh_feed()
             return "break"
         try:
@@ -1189,23 +1230,100 @@ class LiveGlass:
         x, y = x0 + 84, y0 + 27
         maxw = max(60, x1 - x0 - 100)
         cx = None
+        sel = None
+        try:
+            if text and self._entry.select_present():
+                sel = (self._entry.index("sel.first"), self._entry.index("sel.last"))
+        except Exception:
+            sel = None
+        self._input_view = None
         if not text and not focused:
             self.text.draw(x, y, "在这里跟它说话…", anchor="w", fill="#8e9db2",
                            size=11, tags=("inputtext", "inputzone"))
         elif text:
             font = self.fonts.get(11)
             shown, caret_in = self._visible_input(text, maxw, caret)
+            lo = caret - caret_in
+            self._input_view = (x, lo, shown)
+            if sel and sel[1] > lo and sel[0] < lo + len(shown):
+                a = max(0, sel[0] - lo)
+                b = min(len(shown), sel[1] - lo)
+                c.create_rectangle(x + font.measure(shown[:a]), y - 11,
+                                   x + font.measure(shown[:b]), y + 11,
+                                   fill=SEL_FILL, outline="", tags=("inputcursor", "inputzone"))
             self.text.draw(x, y, shown, anchor="w", fill="#eef6ff",
                            size=11, tags=("inputtext", "inputzone"))
-            if focused:
+            if focused and not sel:
                 cx = x + font.measure(shown[:max(0, caret_in)])
         elif focused:
             cx = x
+            self._input_view = (x, 0, "")
         if cx is not None and self._caret_on:
-            c.create_line(cx + 1, y - 9, cx + 1, y + 9,
-                          fill="#b9d7ff", width=1, tags=("inputcursor",))
+            c.create_line(cx + 1, y - CARET_HALF_H, cx + 1, y + CARET_HALF_H,
+                          fill=CARET_COLOR, width=CARET_W, capstyle="round",
+                          tags=("inputcursor",))
+        c.tag_raise("inputtext")
         self._schedule_caret(cx is not None)
         self.text.refresh()
+
+    def _input_index_at(self, px: int) -> int:
+        view = getattr(self, "_input_view", None)
+        if not view:
+            return 0
+        x, lo, shown = view
+        font = self.fonts.get(11)
+        acc = x
+        for i, ch in enumerate(shown):
+            w = font.measure(ch)
+            if px < acc + w / 2:
+                return lo + i
+            acc += w
+        return lo + len(shown)
+
+    def _input_press(self, e) -> None:
+        self._focus_input(keep_caret=True)
+        idx = self._input_index_at(e.x)
+        now = time.time()
+        double = now - getattr(self, "_input_click_at", 0.0) < 0.35
+        self._input_click_at = now
+        try:
+            self._entry.selection_clear()
+            if double:
+                self._entry.selection_range(0, "end")
+                self._entry.icursor("end")
+                self._input_anchor = None
+            else:
+                self._entry.icursor(idx)
+                self._input_anchor = idx
+        except Exception:
+            self._input_anchor = None
+        self._caret_on = True
+        self._render_input()
+
+    def _input_drag(self, e) -> None:
+        a = getattr(self, "_input_anchor", None)
+        if a is None:
+            return
+        b = self._input_index_at(e.x)
+        try:
+            self._entry.icursor(b)
+            if a == b:
+                self._entry.selection_clear()
+            else:
+                self._entry.selection_range(min(a, b), max(a, b))
+        except Exception:
+            return
+        self._caret_on = True
+        self._render_input()
+
+    def _input_select_all(self, _e=None):
+        try:
+            self._entry.selection_range(0, "end")
+            self._entry.icursor("end")
+        except Exception:
+            pass
+        self._render_input()
+        return "break"
 
     def _schedule_caret(self, active: bool) -> None:
         """只有输入框拿着焦点时才跑闪烁定时器；失焦就停，不白烧 after。"""
@@ -1239,7 +1357,7 @@ class LiveGlass:
         self._render_input()
         return None
 
-    def _focus_input(self, _e=None):
+    def _focus_input(self, _e=None, keep_caret: bool = False):
         # noActivate 开着时先摘掉那条样式，否则 focus_force 也拿不到键盘焦点
         # （WS_EX_NOACTIVATE 的窗口本来就不接受焦点）。摘掉后本次运行不再加回，
         # 理由见 `_apply_no_activate`。
@@ -1256,7 +1374,8 @@ class LiveGlass:
                 pass
         try:
             self._entry.focus_force()
-            self._entry.icursor("end")
+            if not keep_caret:
+                self._entry.icursor("end")
         except Exception:
             pass
         self._caret_on = True
@@ -1707,6 +1826,8 @@ class LiveGlass:
                                insertwidth=0, highlightthickness=0)
         self._entry.bind("<KeyRelease>", self._on_input_key)
         self._entry.bind("<Return>", self._send)
+        for seq in ("<Control-a>", "<Control-A>"):
+            self._entry.bind(seq, self._input_select_all)
         self._entry.bind("<FocusIn>", lambda _e: self._render_input())
         self._entry.bind("<FocusOut>", self._on_input_blur)
         # 插入点还能被鼠标和选择改动，这些不发 KeyRelease：不补这几个，点一下
@@ -1760,7 +1881,6 @@ class LiveGlass:
         self._draw_scrollbar()
         self._bind_header()
         c.tag_bind("send", "<Button-1>", self._send)
-        c.tag_bind("inputzone", "<Button-1>", self._focus_input)
         c.tag_raise("close")
         c.tag_raise("send")
 
@@ -2302,7 +2422,7 @@ class LiveGlass:
         if x >= w - corner and y >= h - corner:
             return "se"
         if y <= edge:
-            return None          # 顶部中间只拖动，不缩放
+            return "n" if y <= TOP_EDGE_PX else None
         if x <= edge:
             return "w"
         if x >= w - edge:
@@ -2343,7 +2463,11 @@ class LiveGlass:
                 return
         x0, y0, x1, y1, _r = self._geo.input_shape
         if x0 <= e.x <= x1 and y0 <= e.y <= y1:
-            self._focus_input()
+            if e.x >= x0 + 76:
+                self._input_press(e)
+                self._input_selecting = True
+            else:
+                self._focus_input()
             return
         mode = self._edge_at(e.x, e.y)
         if mode:
@@ -2357,6 +2481,9 @@ class LiveGlass:
                       e.y_root - self.root.winfo_y())
 
     def _motion(self, e):
+        if getattr(self, "_input_selecting", False):
+            self._input_drag(e)
+            return
         if self._resize:
             mode, sx, sy, x0, y0, w0, h0 = self._resize
             dx, dy = e.x_root - sx, e.y_root - sy
@@ -2394,6 +2521,9 @@ class LiveGlass:
             self.root.geometry(f"+{nx}+{ny}")
 
     def _release(self, e):
+        if getattr(self, "_input_selecting", False):
+            self._input_selecting = False
+            return
         if self._resize:
             self._resize = None
             self._preview_at = 0.0

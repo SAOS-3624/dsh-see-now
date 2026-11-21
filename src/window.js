@@ -580,6 +580,46 @@ export function windowAlive() {
 }
 
 /**
+ * 杀掉 pid 指向的**整棵进程树**。
+ *
+ * 为什么不能只 `process.kill(pid)`（issue #75）：Windows 上 spawn 出来的那个 pid 是
+ * **启动器**，真正在画窗口的是它的子进程。杀掉启动器，窗还在屏幕上 —— 而我们这边以为
+ * "旧窗已经收掉了"，接着又 spawn 一个新的。用户看到的就是"每次都起两个窗"。
+ */
+export function killWindowTree(pid) {
+  const id = Number(pid);
+  if (!Number.isInteger(id) || id <= 0) return false;
+  if (process.platform === 'win32') {
+    try {
+      const r = spawnSync('taskkill', ['/PID', String(id), '/T', '/F'], {
+        windowsHide: true, stdio: 'ignore', timeout: 10_000,
+      });
+      if (!r?.error) return true;
+    } catch { /* 退回单进程 kill */ }
+  }
+  try { process.kill(id); return true; } catch { return false; }
+}
+
+/**
+ * 同一时刻只允许**一次**启动在飞（issue #75 的真正根因）。
+ *
+ * `/seenow` 命令直接调 `openWindow()`，而循环那边的 `ensureWindow()` 在 peek/watch 里也会调。
+ * `windowAlive()` 的依据是 pid 文件，而 pid 要等 spawn 之后 700ms 才写 —— 两次调用挤在这
+ * 700ms 里，就都会判"没有窗"，各 spawn 一个。实测（同一台机器，Promise.all 两个 openWindow）
+ * 起了两个真进程。
+ *
+ * 共享同一个 promise 比加锁简单也够用：后到的那次直接拿前一次的结果。
+ * `force` 也不例外 —— 正在开的时候"再强制开一次"只会开出第二个。
+ */
+let opening = null;
+
+export function openWindow(opts = {}) {
+  if (opening) return opening;
+  opening = openWindowOnce(opts).finally(() => { opening = null; });
+  return opening;
+}
+
+/**
  * 开窗（幂等）。
  *
  * 三步都要做，少一步就会得到一个"看起来成功、其实早就退了"的窗：
@@ -590,21 +630,21 @@ export function windowAlive() {
  * `script` 传了就**跳过 resolveScript()**，测试靠这个把自己钉在一个注定失败的脚本上 ——
  * 否则一旦那个脚本不存在，回退链会摸到真的 window.py，测试当场把窗弹到用户脸上（踩过）。
  *
+ * ⚠️ 别直接调它 —— 走上面的 `openWindow()`，那里有"同时只开一次"的闸。
+ *
  * @returns {{ok:boolean, script?:string, python?:string, from?:string, reason?:string, already?:boolean}}
  */
-export async function openWindow({ force = false, log = () => {}, settleMs = 700, script: forced = null,
+async function openWindowOnce({ force = false, log = () => {}, settleMs = 700, script: forced = null,
   onCommand = null, signal = null,
 } = {}) {
   if (process.env.DSH_SEE_NO_WINDOW === '1') return { ok: false, reason: 'disabled' };
   if (!force && windowAlive()) return { ok: true, already: true };
 
   // force、或者 pid 还在但心跳过期（进程卡死/是空窗）才会走到这儿：
-  // 先把上一次那个进程收掉，否则会叠出两个窗口，而用户只看得见一个。
+  // 先把上一次那一棵进程树收掉，否则会叠出两个窗口（关掉的只是启动器，见 killWindowTree）。
   try {
     const old = Number(readFileSync(pidPath(), 'utf8').trim());
-    if (Number.isInteger(old) && old > 0 && old !== process.pid) {
-      try { process.kill(old); } catch { /* 已经没了 */ }
-    }
+    if (Number.isInteger(old) && old > 0 && old !== process.pid) killWindowTree(old);
   } catch { /* 没有 pid 文件，正常首次启动 */ }
 
   const { script, from } = forced
@@ -754,14 +794,14 @@ function waitExit(child, ms) {
 export function closeWindow() {
   if (protocol && !protocol.exited) {
     protocol.state = 'closed';
-    try { protocol.child.kill(); } catch { /* 已经退出 */ }
+    killWindowTree(protocol.child?.pid);
     protocol = null;
     try { unlinkSync(pidPath()); } catch { /* 没有 pid 文件 */ }
     return;
   }
   try {
     const pid = Number(readFileSync(pidPath(), 'utf8').trim());
-    if (Number.isInteger(pid) && pid > 0) process.kill(pid);
+    if (Number.isInteger(pid) && pid > 0) killWindowTree(pid);
   } catch { /* 已经没了 */ }
   try { unlinkSync(pidPath()); } catch { /* 本来就没有 */ }
 }

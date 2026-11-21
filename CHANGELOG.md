@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### Fixed — 每次 `/seenow` 起两个 window.py，关掉一个另一个也没了（#75）
+
+根因是**两条路都会调 `openWindow()`**：命令自己开一次，循环的 `ensureWindow()` 在 peek/watch
+里又开一次。而 `windowAlive()` 的依据是 pid 文件，pid 要 spawn 之后 700ms 才写 —— 两次调用挤在
+这段时间里就都判"没有窗"，各 spawn 一个。实测（同一台机器，`Promise.all` 两个 `openWindow`）
+稳定起两个真进程；`force` 那条路也一样。
+
+- `openWindow` 现在走一道"同时只开一次"的闸：启动在飞时，后到的调用直接拿同一个 promise。
+  `force` 也不例外 —— 正在开的时候再强制开一次，只会开出第二个窗。
+- 收旧窗改用 `killWindowTree()`（Windows 走 `taskkill /T /F`）：原来 `process.kill(pid)` 杀的只是
+  **启动器**，真正在画窗口的是它的子进程 —— 杀了启动器窗还在，接着又 spawn 一个，用户看到的就是
+  "两个窗"。`closeWindow()` 同样改成杀整棵树。
+- 窗口脚本同步上游（dsh-watch-together）：`chat.jsonl` 撞 `EACCES` 时 `append_user` 会用
+  "整份读出 + 临时文件 + `os.replace`"把坏 ACL 换掉；失败时状态栏给可操作的提示，输入框不清空。
+
+新增 `test/window-single-flight.test.mjs`（并发共享同一次启动 / 结束后闸要放开 / 非法 pid 不抛）。
+回归：`test/window*.test.mjs` + command/loop/heartbeat/client-wiring 共 72 项全过；
+`check-syntax.mjs` 51 files ok。并发实测：改前 2 个进程，改后 1 个。
+
 ## [0.2.5] - 2026-11-18
 
 > 0.2.2 与 0.2.4 这两个版本里，桌面版的设置面板一律打不开（「读不到配置：请求不被信任」）。
