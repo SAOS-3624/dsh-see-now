@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.6] - 2026-11-21
 
 ### Fixed — 每次 `/seenow` 起两个 window.py，关掉一个另一个也没了（#75）
 
