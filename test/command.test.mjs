@@ -12,7 +12,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-const { createSeenowCommand, registerSeenowCommand, COMMAND_NAME, COMMAND_USAGE, START_NOTE } =
+const { createSeenowCommand, registerSeenowCommand, shutDownAll, COMMAND_NAME, COMMAND_USAGE, START_NOTE } =
   await import('../src/command.js');
 
 /** 全套假依赖：记录每个入口被调了几次、带了什么参数。 */
@@ -74,6 +74,35 @@ test('/seenow off：停循环 → 停采集 → 关窗 → 告诉模型别再看
   assert.equal(calls.closeWindow, 1);
   assert.equal(calls.steer.length, 1);
   assert.match(r.text, /已关闭/);
+});
+
+/**
+ * issue #76：`see_now({action:"stop"})` 以前只停循环和采集、把窗留在屏幕上 ——
+ * 循环没了就等于 `chat.jsonl` 没人消费，窗里打的字回车有反应、永远没有回音。
+ * 现在 stop 与 `/seenow off` 共用「彻底收工」三件套。
+ */
+test('收工三件套：顺序是 停循环 → 停采集 → 关窗（#76）', () => {
+  const order = [];
+  const r = shutDownAll({
+    stopLoop: (reason) => order.push('loop:' + reason),
+    stopCapture: () => order.push('capture'),
+    closeWindow: () => order.push('window'),
+  }, '手动 stop');
+  assert.deepEqual(order, ['loop:手动 stop', 'capture', 'window'],
+    '循环必须先停：先关窗会被判成"用户关窗"，落一条挂断、以后 watch 全被硬闸拦');
+  assert.equal(r.windowClosed, true);
+});
+
+test('收工三件套：哪一步没在跑/抛错，后面两步照走', () => {
+  const order = [];
+  const r = shutDownAll({
+    stopLoop: () => { throw new Error('没在跑'); },
+    // stopCapture 干脆不给
+    closeWindow: () => order.push('window'),
+  });
+  assert.deepEqual(order, ['window']);
+  assert.equal(r.windowClosed, true);
+  assert.equal(shutDownAll({}).windowClosed, false, '什么都没给也不能抛');
 });
 
 test('/seenow status：给三行短状态（不是工具那十几行）', async () => {

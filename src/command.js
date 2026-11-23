@@ -53,6 +53,30 @@ export function sessionOfAgent(agent) {
 }
 
 /**
+ * 「彻底收工」三件套：循环 → 采集 → 悬浮窗。
+ *
+ * `/seenow off` 与 `see_now({action:"stop"})` **必须**共用这一份实现：
+ * 一处关窗、一处留窗，用户看到的就是"命令关了、工具没关"的割裂。而留窗那种更糟 ——
+ * 循环没了 = `chat.jsonl` 再没有人消费，窗里打的字回车有反应、永远没有回音（issue #76）。
+ *
+ * 每一步都吞异常：某一步没在跑，不该拦住后面两步。
+ *
+ * @returns {{windowClosed:boolean}} 有没有真的去执行关窗（给文案与测试用）
+ */
+export function shutDownAll(deps = {}, reason = '手动') {
+  let windowClosed = false;
+  try { deps.stopLoop?.(reason); } catch { /* 没在跑 */ }
+  try { deps.stopCapture?.(); } catch { /* 没在跑 */ }
+  try {
+    if (deps.closeWindow) {
+      deps.closeWindow();
+      windowClosed = true;
+    }
+  } catch { /* 已经关了 */ }
+  return { windowClosed };
+}
+
+/**
  * 构造命令定义（纯对象，方便单测直接调 `handler`）。
  *
  * @param {object} deps - 全部由 `index.js` 注进来，命令自己不去碰 runner/window 的单例
@@ -102,9 +126,7 @@ export function createSeenowCommand(deps = {}) {
   }
 
   function off(onAgent) {
-    try { deps.stopLoop?.('/seenow off'); } catch { /* 没在跑 */ }
-    try { deps.stopCapture?.(); } catch { /* 没在跑 */ }
-    try { deps.closeWindow?.(); } catch { /* 已经关了 */ }
+    shutDownAll(deps, '/seenow off');
     const said = deliverToAgent(onAgent, STOP_NOTE);
     return {
       kind: 'success',

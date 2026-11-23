@@ -23,7 +23,7 @@ import { defineToolCompat } from './define-tool.js';
 import { createSettingsApi, ROUTE_PREFIX } from './settings-api.mjs';
 import { windowAlive, windowHidden, setWindowHidden, hiddenForShow, windowReport, windowLine,
   setWindowDanmaku, readWindowDanmaku, openWindow, closeWindow } from './window.js';
-import { registerSeenowCommand, COMMAND_NAME } from './command.js';
+import { registerSeenowCommand, shutDownAll, COMMAND_NAME } from './command.js';
 import { pickRegion, loadRegion, saveRegion, clearRegion, regionText } from './region.js';
 import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
@@ -1427,9 +1427,27 @@ async function registerAll(ctx) {
       }
 
       if (action === 'stop') {
-        stopLoop('手动 stop');
-        runner.stop();
-        return { text: '停了。窗口还开着，想再看得重新调 watch。', meta: { ok: true } };
+        /**
+         * **窗一起收掉**（issue #76）。
+         *
+         * 以前只停循环和采集、把窗留在屏幕上，理由写在文案里（"窗口还开着"）——
+         * 但循环没了就意味着 `chat.jsonl` 再没有人消费：用户在窗里打的字回车有反应、
+         * 永远不会有人回，`status` 还写着"窗口：活着 · 显示中"。用户侧看到的就是
+         * "它还在听吗？"的静默失败。
+         *
+         * `/seenow off` 一直是连窗一起关的；两个入口对同一件事给出两种结果，本身就是坑。
+         * 现在共用 `shutDownAll()`（顺序：先停循环，再停采集，最后关窗 ——
+         * 循环先停掉，关窗就不会被判定成"用户关窗"而落一条挂断）。
+         */
+        shutDownAll({
+          stopLoop: (reason) => stopLoop(reason),
+          stopCapture: () => runner.stop(),
+          closeWindow: () => closeWindow(),
+        }, '手动 stop');
+        return {
+          text: '停了。窗口也关了 —— 想再看就说一声，调一次 watch 会重新开窗。',
+          meta: { ok: true },
+        };
       }
 
       /**
