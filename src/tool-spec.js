@@ -64,6 +64,12 @@ export function seeNowToolSpec() {
       + 'Safety net: if you stop calling `watch`, the plugin keeps capturing and wakes you with a short '
       + 'note when a sheet fills up (then `peek`). It stops the moment the user closes the floating '
       + 'window and tells you — when that note appears, do NOT call `see_now` again until the user asks.\n\n'
+      // 总开关（issue #77）：模型必须知道这条路是关死的，否则它会一直重试、或者去 `window show`
+      // 找绕过的路（那条路也过不去，闸在更早的地方）。
+      + '**There is a user-side master switch.** If `watch` / `start` / `peek` comes back with '
+      + '`reason:"disabled-by-user"`, the user has turned screen reading off. That is not a fault and '
+      + 'you cannot reopen it from any action — no parameter, no `window show`, no retry. Only the user '
+      + 'can (the settings page, or `/seenow on`). Say so plainly and wait; do not keep polling.\n\n'
       + '**`say` is the ONLY thing the user sees and hears at the moment you say it.** Your normal reply '
       + 'is appended to the window log afterwards (so the record is complete) but is never spoken and '
       + 'never shows up as a bubble on time — only `say` does. So whenever the user might be waiting, '

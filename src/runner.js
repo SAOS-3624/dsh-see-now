@@ -147,7 +147,9 @@ function optsSig(o) {
 /**
  * 「这一条 watch 该不该被硬闸拦下」的**纯函数**（好测，也好读）。
  *
- * 三条规矩：
+ * 四条规矩：
+ * - **用户关了总开关**（`disabled`，issue #77）→ 谁来说都不放行，连显式来源也不行。
+ *   这一条必须排在最前：它是"我不许你看屏幕"，不是"这一轮不想看"。
  * - 用户关过窗（`hungUp`）→ 除非他显式说了要看什么，否则不重开。
  * - 文件放完了（`fileEnded`）→ 同上，文件回放是一次性的，不能自动重播。
  * - 显式传了来源 = 用户明确要求 → 一律放行。
@@ -163,7 +165,8 @@ export function resumeFromReopen({ hungUp = false, winAlive = false, pidNow = 0,
   return Boolean(hungUp && winAlive && pidNow > pidAtHangUp);
 }
 
-export function guardReason({ hungUp = false, fileEnded = false, explicitSrc = false } = {}) {
+export function guardReason({ hungUp = false, fileEnded = false, explicitSrc = false, disabled = false } = {}) {
+  if (disabled) return 'disabled-by-user';
   if (explicitSrc) return null;
   if (hungUp) return 'hung-up';
   if (fileEnded) return 'file-ended';
@@ -266,6 +269,14 @@ export function createRunner({
    * 0.3 = 0.4.0 之前的老行为：每张多装 8.9% 帧，但格子要裁掉三成画面。
    */
   maxCrop = 0,
+  /**
+   * **用户侧的「屏幕读取总开关」初值**（`~/.dsh/see-now.json` 的 `enabled`，默认开）。
+   *
+   * 只在这里取初值：之后的状态由 `setEnabled()` 改，**不每拍读盘**（拿帧率换便利不划算）。
+   * 设置页和 `/seenow` 改完都会调 `setEnabled()`，所以"改完立刻生效"由调用方保证，
+   * 不靠重启。
+   */
+  enabled = true,
 } = {}) {
   let pipeline = null;   // 当前（或刚停的）引擎 —— 停采集后仍留着，好把队列里剩的图发完
   let running = false;
@@ -516,6 +527,13 @@ export function createRunner({
   let hungUp = false;
   /** 挂断时 pid 文件的 mtime；用来识别"用户又手动把窗开回来了" */
   let hungUpStamp = 0;
+  /**
+   * 用户侧的「屏幕读取总开关」（issue #77）。`false` = 用户不许看屏幕。
+   *
+   * 和 `hungUp` 的区别见 `guardReason` 的注释：这一条连"显式传了来源"也不放行，
+   * 而且**模型没有任何 action 能把它打开**（只有设置页 / `/seenow on` 能）。
+   */
+  let screenEnabled = enabled !== false;
   /** 最近一次的采集源（teardown 会把 `source` 清空，但事后判断还需要它） */
   let lastSource = null;
   /**
@@ -597,6 +615,11 @@ export function createRunner({
    */
   async function start({ src = { kind: 'screen' }, opts = {}, quality: q = null,
     restart = false, reuse = false } = {}) {
+    /**
+     * 总开关关掉时**连 `already` 都不回**：回"已经在看了"会让模型以为还能接着看，
+     * 于是它继续 peek，而 peek 也已经被拦住了 —— 用户看到的是"它说在看，但什么都没给"。
+     */
+    if (!screenEnabled) return { blocked: 'disabled-by-user', source: null };
     if (running && !restart && !reuse) return { already: true, source };
     // 走到这里就是"明确要开始看"（watch 的自动重启已经在前面被硬闸挡住了）。
     hungUp = false;
@@ -930,6 +953,33 @@ export function createRunner({
     pause, resume, seek, configure,
     stop() { teardown('手动'); return { stopped: true }; },
     /**
+     * 改「屏幕读取总开关」（issue #77）。
+     *
+     * **谁负责落盘**：这个方法只管内存状态。落盘由调用方做（设置页走 `writeTuning`，
+     * `/seenow on|off` 也走它）—— 因为 runner 不该知道配置文件长什么样，
+     * 而且 tests 里很多 runner 是裸建的，凭空写盘会污染测试机。
+     *
+     * 关掉时顺手 `teardown`：
+     * - 不 teardown 的话"关掉之后不采集"就是假的 —— 采集还在跑，只是没人取图；
+     * - 循环那边的停机由调用方一起做（`index.js` 的 `applyEnabled`），
+     *   因为 loop 不归 runner 管。
+     *
+     * @returns {{enabled:boolean, wasEnabled:boolean}}
+     */
+    setEnabled(next) {
+      const wasEnabled = screenEnabled;
+      screenEnabled = next !== false;
+      if (wasEnabled && !screenEnabled) {
+        teardown('用户关闭屏幕读取');
+        log('用户关掉了屏幕读取总开关 —— 采集已停，不会再取图。');
+      } else if (!wasEnabled && screenEnabled) {
+        log('用户打开了屏幕读取总开关。');
+      }
+      return { enabled: screenEnabled, wasEnabled };
+    },
+    /** 总开关现在是开还是关（设置页、`/seenow status`、循环都用它）。 */
+    enabled() { return screenEnabled; },
+    /**
      * 用户关掉了悬浮窗 = 明确表示"不看了"。
      *
      * 只 `stop()` 不够：下一条 `watch` 看到 `stopped` 会立刻重启采集并把窗**重新开起来**，
@@ -1059,8 +1109,14 @@ export function createRunner({
        * 从第 0 秒重来（社区实报的 24 秒解 1955 帧）。
        */
       const blocked = guardReason({
-        hungUp, fileEnded: Boolean(endedSource) && !running, explicitSrc,
+        hungUp,
+        fileEnded: Boolean(endedSource) && !running,
+        explicitSrc,
+        // 总开关关掉时**连 explicitSrc 也不放行**：它表达的是"我不许你看屏幕"，
+        // 不是"这一轮不想看"。模型换个说法带上 src 就能绕过去的闸不算闸。
+        disabled: !screenEnabled,
       });
+      if (blocked === 'disabled-by-user') return { ok: false, reason: 'disabled-by-user', waited: 0 };
       if (blocked === 'hung-up') return { ok: false, reason: 'hung-up', waited: 0 };
       if (blocked === 'file-ended') {
         return { ok: false, reason: 'file-ended', waited: 0, path: endedSource?.path };
@@ -1276,6 +1332,12 @@ export function createRunner({
      * 这期间队列可能已经被别的路径取空了 —— 那正是"叫了 6 次、多数 peek 是空"的原因。
      */
     peek() {
+      /**
+       * 总开关关掉时不给图（issue #77）。为什么不"给完手上这几张再停"：
+       * 用户按下开关的意图是"别再看我的屏幕了"，而队列里那些图正是他不想给的东西 ——
+       * 交出去反而更糟。`[]` 和"还没攒到"在 index.js 那里是两条文案，不会混。
+       */
+      if (!screenEnabled) return [];
       // 超省模式下这里可能一次拿到多张 —— 和 `watch` 同一个口径，
       // 否则"攒了 3 张但 peek 只给 1 张"等于白攒。
       const queued = attachSheets(takeSheets('peek'));
@@ -1318,6 +1380,13 @@ export function createRunner({
         source,
         lastSource,
         hungUp,
+        /**
+         * 用户关掉了「屏幕读取总开关」没有（issue #77）。
+         *
+         * **必须进 status**：模型看到 `enabled:false` 才知道"不是它坏了，
+         * 是用户不许看"，而不是继续重试 `watch` / 说"我看不到屏幕"。
+         */
+        enabled: screenEnabled,
         endedFile: endedSource?.path ?? null,
         quality,
         size: SIZES[quality],

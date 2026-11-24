@@ -30,7 +30,7 @@ import { deliverToAgent, serviceOf } from './timer.js';
 export const COMMAND_NAME = 'seenow';
 
 /** 一句话说明（显示在 `/` 菜单里）。 */
-export const COMMAND_DESCRIPTION = '打开看屏幕悬浮窗，开始实时看你的屏幕（/seenow off 关掉）';
+export const COMMAND_DESCRIPTION = '打开看屏幕悬浮窗，开始实时看你的屏幕（/seenow off 关掉并禁止采集）';
 
 /** 用法（错误时回给用户）。 */
 export const COMMAND_USAGE = `用法：/${COMMAND_NAME} [off|status|show|hide]`;
@@ -43,8 +43,10 @@ export const START_NOTE = '[看屏幕] 用户用 `/seenow` 把悬浮窗打开了
   + '用户关窗 = 不看了，循环会自己停。';
 
 /** 关闭后投给模型的那句话。 */
-export const STOP_NOTE = '[看屏幕] 用户用 `/seenow off` 关掉了悬浮窗：采集停了、循环也停了。\n'
-  + '不要再调 `see_now`，也不要再 `say`（他看不到）。只回一句短的就行。';
+export const STOP_NOTE = '[看屏幕] 用户用 `/seenow off` 关掉了悬浮窗，并且**关掉了屏幕读取总开关**：\n'
+  + '采集停了、循环停了，`watch` / `start` / `peek` 现在一律会被拒。\n'
+  + '不要再调 `see_now`，也不要再 `say`（他看不到）。只回一句短的就行。\n'
+  + '想接着看得等他自己打开（`/seenow on` 或设置页那一格）—— 你打不开。';
 
 /** 把宿主给的 agent 折成会话 id（`Session.header.id`，老版本是 `Session.id`）。 */
 export function sessionOfAgent(agent) {
@@ -90,12 +92,22 @@ export function shutDownAll(deps = {}, reason = '手动') {
  * @param {()=>object} deps.getLoop
  * @param {(reason:string)=>void} deps.stopLoop
  * @param {()=>string} deps.statusText
+ * @param {(next:boolean)=>{enabled:boolean, saved?:object}} [deps.setScreenEnabled]
+ *   「屏幕读取总开关」（issue #77）。**命令是用户侧入口**，所以要落盘；
+ *   关掉时它内部会连带停循环 / 停采集 / 关窗，`off` 不必再 `shutDownAll` 一次。
+ *   老调用方不给这个函数时，`off` 退回原来那条 `shutDownAll` 的路。
  */
 export function createSeenowCommand(deps = {}) {
   const log = deps.log ?? (() => {});
   const caller = () => deps.getCaller?.() ?? null;
 
   async function open(onAgent) {
+    /**
+     * 先把总开关打开（issue #77）。**顺序不能反**：关着的时候开窗是没用的 ——
+     * 采集起不来，用户看到的是"窗开了、字也打了、什么都没发生"。
+     * 落盘失败也不拦住开窗（这次已经能看了），只是下次启动会回到关着的状态。
+     */
+    try { deps.setScreenEnabled?.(true); } catch (e) { log(`总开关没能打开：${e?.message ?? e}`); }
     const win = await deps.openWindow?.({ log });
     if (win && win.ok === false && win.reason !== 'disabled') {
       return { kind: 'error', text: `悬浮窗没开起来：${win.reason ?? '原因未知'}` };
@@ -126,11 +138,27 @@ export function createSeenowCommand(deps = {}) {
   }
 
   function off(onAgent) {
-    shutDownAll(deps, '/seenow off');
+    /**
+     * **`off` 同时关总开关**（issue #77）。为什么合并：用户说"关掉"时，
+     * 意图从来不只是"关这一扇窗"，而是"别再看我屏幕了" —— 以前那条闸只能由模型
+     * 去关，方向是反的。合并之后 `/seenow off` 是**持久**的：直到他再 `/seenow on`。
+     *
+     * `setScreenEnabled(false)` 内部已经做了 `shutDownAll`（循环 → 采集 → 窗），
+     * 所以这里只在"没有这个依赖"（老调用方 / 单测）时退回老路。
+     */
+    let gated = false;
+    try {
+      gated = Boolean(deps.setScreenEnabled?.(false));
+    } catch (e) {
+      log(`总开关没能关掉：${e?.message ?? e}`);
+    }
+    if (!gated) shutDownAll(deps, '/seenow off');
     const said = deliverToAgent(onAgent, STOP_NOTE);
     return {
       kind: 'success',
-      text: `悬浮窗已关闭，采集和循环都停了。${said?.ok ? '' : `（没能叫醒本会话：${said?.reason ?? '未知'}）`}`,
+      text: `悬浮窗已关闭，采集和循环都停了。`
+        + `${gated ? '屏幕读取总开关也关了 —— 要再看得 /seenow on 或去设置页打开。' : ''}`
+        + `${said?.ok ? '' : `（没能叫醒本会话：${said?.reason ?? '未知'}）`}`,
     };
   }
 

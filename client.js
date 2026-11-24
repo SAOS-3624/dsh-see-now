@@ -52,6 +52,16 @@ window.__ModuleLoader__.load({
       'state.saved': '已保存。重开 DSH 生效。',
       'state.savedLocal': '已保存。下一次转写就用新地址。',
       'state.nosave': '没有改动。',
+      // ── 屏幕读取总开关（issue #77）──
+      'gate.title': '屏幕读取（总开关）',
+      'gate.doOff': '关掉 —— 别再看了',
+      'gate.doOn': '打开 —— 可以再看',
+      'gate.stateOn': '现在：开（画面变了才会交图）',
+      'gate.stateOff': '现在：关。采集已停，watch / start / peek 一律被拒 —— 这是你按的，不是坏了。',
+      'gate.hint': '这一格是用户侧的闸，改完立刻生效，不用保存、也不用重开 DSH。'
+        + '关掉之后只有你自己能打开它（这一格，或者先 /seenow off 再用 /seenow on）——'
+        + 'AI 调任何工具都打不开，它只能请你开。',
+      'gate.applied': '已生效。',
       'sec.common': '常用',
       'sec.advanced': '高级（一般不用动）',
       'field.prefer': '用哪个转写服务',
@@ -420,6 +430,8 @@ window.__ModuleLoader__.load({
       // 悬浮窗样式又是另一个文件（watch-window.json）：也是改完立刻生效，所以单独一套状态
       const [windowStyle, setWindowStyleState] = useState('');
       const [windowAt, setWindowAt] = useState(0);
+      // 「屏幕读取总开关」（issue #77）：同样改完立刻生效，不等「保存」
+      const [gateAt, setGateAt] = useState(0);
 
       const load = useCallback(async () => {
         setBusy(true);
@@ -572,6 +584,45 @@ window.__ModuleLoader__.load({
         }
       };
 
+      /**
+       * 「屏幕读取总开关」——**改完立刻生效，不等「保存」**（issue #77）。
+       *
+       * 为什么不走保存按钮：它不是一个"调参"，是"现在别看了"。用户点完开关还要再点一次
+       * 保存，中间那段时间他以为已经关了 —— 而这段时间正好是它还在采集的时候。
+       *
+       * 乐观更新 + 失败回滚：开关必须跟手（服务端一个来回几十毫秒，期间 UI 停在旧值会像卡住），
+       * 但服务端拒了就立刻重新拉一次真值，不能假装成功。
+       */
+      const applyGate = async (next) => {
+        setGateAt(0);
+        setError('');
+        setRejected([]);
+        setData(current => (current
+          ? { ...current, values: { ...current.values, enabled: next } }
+          : current));
+        try {
+          const result = await api('/config', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ patch: { enabled: next } }),
+          });
+          if (result.ok) {
+            setData(current => (current ? {
+              ...current,
+              values: { ...current.values, enabled: result.values?.enabled ?? next },
+              warnings: result.warnings ?? current.warnings,
+            } : current));
+            setGateAt(Date.now());
+          } else {
+            setError((result.rejected ?? []).join('；'));
+            await load();
+          }
+        } catch (err) {
+          setError(String(err?.message ?? err));
+          await load();
+        }
+      };
+
       if (data === null || draft === null) {
         return h('div', { className: 'sn_root' },
           h('div', { className: 'sn_hero' },
@@ -682,6 +733,28 @@ window.__ModuleLoader__.load({
           data.trust?.path === 'legacy'
             ? h('div', { className: 'sn_mono', style: { opacity: 0.7 } }, t('hint.trust.legacy'))
             : null),
+
+        /*
+         * 总开关（issue #77）放在**最上面**，连警告都在它下面。
+         *
+         * 理由：这一页其它每一项都是"调参"，只有它是"现在别看了"。用户着急的时候
+         * 往下翻一屏找它，和它就在第一行，是两个体验。而且关着的时候必须一眼看到 ——
+         * 否则"它怎么不动了"会被当成 bug。
+         */
+        h('div', { className: 'sn_card' },
+          h('div', { className: 'sn_cardhd' }, h('span', { className: 'sn_cardname' }, t('gate.title'))),
+          h('div', { className: 'sn_box' + (data.values.enabled === false ? ' warn' : '') },
+            h('div', { className: 'sn_row' },
+              h('button', {
+                className: 'sn_btn',
+                // 关着的时候按钮做成"打开"（绿），开着的时候做成"关掉"，不要两个按钮
+                onClick: () => { void applyGate(!(data.values.enabled !== false)); },
+                disabled: busy,
+              }, data.values.enabled === false ? t('gate.doOn') : t('gate.doOff')),
+              h('span', { className: 'sn_label' },
+                data.values.enabled === false ? t('gate.stateOff') : t('gate.stateOn'))),
+            h('p', { className: 'sn_note', style: { margin: '8px 0 0' } }, t('gate.hint'))),
+          gateAt > 0 ? h('span', { className: 'sn_ok', role: 'status' }, t('gate.applied')) : null),
 
         data.warnings.length > 0
           ? h('div', { className: 'sn_box warn', role: 'status' },

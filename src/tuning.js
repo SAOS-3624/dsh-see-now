@@ -22,6 +22,21 @@ import { LEVEL_THRESHOLDS } from './tiers.js';
 
 /** 与 loop.js 的常量保持一致；这里放默认值是为了不形成反向依赖。 */
 export const TUNING_DEFAULTS = Object.freeze({
+  /**
+   * **用户侧的「屏幕读取总开关」**（issue #77 第 3 条），默认开。
+   *
+   * 为什么需要它：在这之前，"别看了"只有两个入口，`stop` 和 `pause`，**都是模型调的**；
+   * 用户自己唯一能按的是关窗。也就是"关掉看屏幕"这件事得先说服模型去做 —— 方向反了。
+   * 用户的原话很直接：「一不小心会向 AI 输入大量无效画面」。
+   *
+   * 关掉之后 `watch` / `start` / `peek` 一律硬拒（不是软提示），且**只有用户侧入口能打开**：
+   * 设置页的开关、`/seenow on`。`see_now` 工具**没有**任何能打开它的 action ——
+   * 模型自己能解开的闸不算闸（和 `guardReason` 里的 `hung-up` 同一个道理）。
+   *
+   * 和 `hungUp` 的区别：`hungUp` 允许"显式传了来源"放行（用户明确说了要看什么），
+   * 这个开关**连显式来源也不放行** —— 它表达的是"我不许你看屏幕"，不是"这一轮不想看"。
+   */
+  enabled: true,
   maxAutonomousWakes: 8,
   idleStopMin: 3,
   defaultPace: 'normal',
@@ -299,6 +314,18 @@ export function readTuning({ env = process.env, readFile = readFileSync } = {}) 
     raw = {};
   }
 
+  /**
+   * 总开关。**只认真正的布尔** —— 写成 `"false"` 是最容易踩的坑（字符串是真值，
+   * 用户以为关掉了，实际一直开着），所以类型不对就报出来并回默认（开）。
+   */
+  let enabled = TUNING_DEFAULTS.enabled;
+  if (raw.enabled !== undefined) {
+    if (typeof raw.enabled === 'boolean') enabled = raw.enabled;
+    else {
+      warnings.push(`enabled 只能是 true / false（收到 ${JSON.stringify(raw.enabled)}），已用默认 true`);
+    }
+  }
+
   const maxAutonomousWakes = clampInt(
     raw.maxAutonomousWakes, 1, 200, TUNING_DEFAULTS.maxAutonomousWakes,
   );
@@ -464,6 +491,7 @@ export function readTuning({ env = process.env, readFile = readFileSync } = {}) 
   warnings.push(...listenCfg.warnings);
 
   return {
+    enabled,
     maxAutonomousWakes,
     idleStopMin,
     wakeBatch,
@@ -490,6 +518,7 @@ export function readTuning({ env = process.env, readFile = readFileSync } = {}) 
 
 /** 面板能改的顶层键。`idleStopMs` 是派生的，不在这里 —— 传进来会被拒。 */
 export const WRITABLE_KEYS = Object.freeze([
+  'enabled',
   'maxAutonomousWakes', 'idleStopMin', 'wakeBatch', 'imageTrigger', 'imageKeep', 'tierStyle', 'tierMap',
   'tierMode', 'tierCurve', 'tierThresholds',
   'defaultPace', 'speechPacing', 'scoreNormalize', 'maxCrop', 'listen',

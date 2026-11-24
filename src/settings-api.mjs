@@ -107,7 +107,17 @@ function valuesOf(tuning) {
   return values;
 }
 
-export function createSettingsApi({ logger } = {}) {
+/**
+ * @param {object} [opts]
+ * @param {object} [opts.logger] 宿主 logger
+ * @param {()=>boolean} [opts.getEnabled] 「屏幕读取总开关」的**实况**（内存里那个，
+ *   不是文件里那个）。为什么不直接报 `readTuning()`：开关改完立刻生效、不重读配置，
+ *   文件是"下次启动的意图"，内存是"现在的状态" —— 面板要显示后者，否则用户刚点完
+ *   开关、面板回的还是旧值，看起来像没生效。
+ * @param {(next:boolean, o?:{persist?:boolean})=>object} [opts.setEnabled]
+ *   `/config` 落盘成功后通知索引层改内存状态（**不再写一次盘**，`writeTuning` 已经写了）。
+ */
+export function createSettingsApi({ logger, getEnabled, setEnabled } = {}) {
   function log(line) {
     try {
       logger?.info?.(line);
@@ -195,7 +205,8 @@ export function createSettingsApi({ logger } = {}) {
         send(res, 200, {
           ok: true,
           path: tuning.path,
-          values: valuesOf(tuning),
+          // 总开关报**实况**：文件是"下次启动的意图"，内存是"现在"。面板要后者。
+          values: { ...valuesOf(tuning), enabled: getEnabled ? getEnabled() !== false : tuning.enabled },
           defaults: defaultsPayload(),
           paces: PACES_KEYS,
           writable: { keys: WRITABLE_KEYS, listen: WRITABLE_LISTEN_KEYS },
@@ -222,6 +233,17 @@ export function createSettingsApi({ logger } = {}) {
         const result = writeTuning(patch);
         if (result.ok) log(`see-now: 配置已写回 ${result.path}`);
         else log(`see-now: 配置被拒 ${JSON.stringify(result.rejected)}`);
+
+        /**
+         * 总开关是**唯一一个改完要立刻生效**的键（issue #77）：
+         * 别的键（收工线、帧率、档位）都影响"下一次采集"，重开 DSH 才生效也无所谓；
+         * 这个开关本身就是"现在别看了"，还等重启就等于没做。
+         *
+         * `persist:false` —— `writeTuning` 刚写完，再写一次是重复的。
+         */
+        if (result.ok && result.values?.enabled !== undefined && setEnabled) {
+          try { setEnabled(result.values.enabled, { persist: false }); } catch { /* 状态同步失败不该让保存失败 */ }
+        }
 
         // 回包给的是**写完之后文件里的完整快照**，不是 `writeTuning().values` ——
         // 后者按"规矩 3"只含这次提交的键，前端拿它当整份配置重建草稿时，

@@ -1,6 +1,34 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.7] - 2026-11-24
+
+### Added — 屏幕读取总开关（`enabled`，#77 第 3 条）
+
+在这之前，"别看了"只有两个入口，`stop` 和 `pause`，**都是模型调的**；用户自己唯一能按的是关窗。
+也就是"关掉看屏幕"这件事得先说服模型去做 —— 方向反了。用户的原话：「一不小心会向 AI 输入
+大量无效画面」。
+
+`~/.dsh/see-now.json` 加 `enabled`（默认 `true`）。关掉之后：
+
+- `watch` / `start` / `peek` **一律立刻返回 `reason:"disabled-by-user"`**，不采集、不取图、不叫醒；
+- **显式传 `source` 也不放行** —— 这和 `hungUp` 是两件事：那条闸允许"用户明确说了要看什么"，
+  这条表达的是"我不许你看屏幕"，所以它排在 `guardReason` 的最前面；
+- **`see_now` 没有任何 action 能打开它**。模型能自己解开的闸不算闸。能打开的只有两个用户侧入口：
+  设置页那一格、`/seenow on`；
+- 关掉时顺手 `teardown` + 停循环 + 关窗（不 teardown 的"关掉"是假的：采集还在跑，只是没人取图；
+  不关窗则循环已经没了、窗里打字永远没人回 —— 同 #76 那个坑）。
+
+改完**立刻生效**，不重读配置、不重开 DSH：内存里那个状态由 `runner.setEnabled()` 管，
+设置页走 `/config` 写盘后直接通知它（`persist:false`，不再重复写），`/seenow on|off` 走同一份
+`applyEnabled()`。`status` 多一行「总开关：开 / **关**」，`/seenow status` 也一样 —— 关着的时候
+第一眼就能看出"是你关的，不是坏了"。
+
+`/seenow off` 从这一版起**也是持久的**：除了收工，还把 `enabled` 落成 `false`。
+用户说"关掉"时的意图从来不只是关这一扇窗。
+
+新增 `test/screen-gate.test.mjs`（7 项：`disabled` 压过显式来源 / 关掉后三个入口全拒且不去开窗 /
+配置写成字符串要报错 / `/seenow off` 不重复 `shutDownAll` / 设置页落盘并通知 `persist:false` /
+`/status` 报内存实况而非文件）。
 
 ### Fixed — `stop` 之后悬浮窗还开着、能打字但没人理（#76）
 

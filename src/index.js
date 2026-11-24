@@ -17,7 +17,7 @@ import { ensureConfiguredVoice, detachAdapters, attachedAdapters, configuredVoic
 import { speechSubscribers, onSpeech } from './speech.js';
 import { markSpeaking } from './listen.js';
 import { startLoop, HANGUP_NOTE } from './loop.js';
-import { readTuning, TIER_STYLES } from './tuning.js';
+import { readTuning, writeTuning, TIER_STYLES } from './tuning.js';
 import { planOffload, planOffloadWithTrigger, applyOffload } from './offload.js';
 import { defineToolCompat } from './define-tool.js';
 import { createSettingsApi, ROUTE_PREFIX } from './settings-api.mjs';
@@ -547,13 +547,13 @@ export async function apply(ctx) {
  *
  * 这里整段包在 try 里：面板是附加能力，挂不上只该少一页设置，不该影响看屏幕。
  */
-function installSettings(ctx, log) {
+function installSettings(ctx, log, gate = {}) {
   try {
     if (typeof ctx?.inject !== 'function') {
       log('宿主没有 ctx.inject，跳过设置页接口');
       return;
     }
-    const handle = createSettingsApi({ logger: ctx?.logger });
+    const handle = createSettingsApi({ logger: ctx?.logger, ...gate });
     ctx.inject(['webServer'], (scoped) => {
       /*
        * 认证交给内核，我们只接结果。
@@ -620,7 +620,12 @@ async function registerAll(ctx) {
   const tuning = readTuning();
   if (tuning.warnings.length) log?.(`[see-now] ${tuning.warnings.join('；')}`);
 
-  installSettings(ctx, log);
+  // 设置页那条路要把总开关的实况读/写接进来（issue #77）。箭头函数只是建闭包，
+  // 真正求值要等到请求进来 —— 那时 `runner` 早就建好了。
+  installSettings(ctx, log, {
+    getEnabled: () => runner.enabled(),
+    setEnabled: (next, o) => applyEnabled(next, o),
+  });
   const runner = createRunner({
     ffmpegPath: ffmpeg.path,
     log,
@@ -629,6 +634,8 @@ async function registerAll(ctx) {
     listen: tuning.listen,
     // 变化日志（`~/.dsh/see-now.json` 的 `changeLog`，默认关）
     changeLog: tuning.changeLog,
+    // 屏幕读取总开关的初值（`enabled`，默认开）。之后由 `setEnabled` 改，不重读配置
+    enabled: tuning.enabled,
     // 超省模式：攒够几张图才交（`wakeBatch`，默认 1 = 现在这样）
     wakeBatch: tuning.wakeBatch,
     // 采集帧率（`fps`，默认 12）。采集与打分共用这一个值
@@ -959,6 +966,45 @@ async function registerAll(ctx) {
   disposers.push(() => stopLoop('插件卸载'));
 
   /**
+   * 改「屏幕读取总开关」——**三个入口共用这一份**（issue #77）。
+   *
+   * | 入口 | 谁调 | 落盘 |
+   * |---|---|---|
+   * | 设置页那一格 | `settings-api.mjs` 的 `/config` | 它自己写完再调这里（`persist:false`）|
+   * | `/seenow on` / `/seenow off` | `command.js` | 这里写 |
+   * | `see_now` 工具 | **调不到** —— 模型能解开的闸不算闸 | — |
+   *
+   * 关掉时连带 `shutDownAll`：不关采集，"关掉之后不采集"就是假的；不关窗，
+   * 循环已经没了而窗还在，用户在窗里打字回车有反应、永远没人回（#76 那条）。
+   * 顺序交给 `shutDownAll`（先循环、再采集、最后窗），见它的注释。
+   *
+   * @param {boolean} next
+   * @param {{persist?:boolean}} [o]
+   * @returns {{enabled:boolean, wasEnabled:boolean, saved:object}}
+   */
+  function applyEnabled(next, { persist = true } = {}) {
+    const want = next !== false;
+    const r = runner.setEnabled(want);
+    if (!want) {
+      shutDownAll({
+        stopLoop: (reason) => stopLoop(reason),
+        stopCapture: () => { try { runner.stop(); } catch { /* 没在跑 */ } },
+        closeWindow: () => closeWindow(),
+      }, '用户关闭屏幕读取');
+    }
+    let saved = { ok: true, skipped: true };
+    if (persist) {
+      saved = writeTuning({ enabled: want });
+      if (!saved.ok) {
+        // 写不进去也要让这一次生效（内存已经改了），但必须说出来 ——
+        // 否则用户以为"关掉了"，重启 DSH 又开了。
+        log(`总开关写不进 see-now.json：${(saved.rejected ?? []).join('；') || '未知原因'}`);
+      }
+    }
+    return { ...r, saved };
+  }
+
+  /**
    * 一行状态（给 `/seenow status` 用）。
    *
    * 工具的 `status` 是**诊断用**的十几行；命令只是"看一眼"，倒那么多反而看不清。
@@ -972,6 +1018,8 @@ async function registerAll(ctx) {
       : (st.pending ? `停了，队列里还有 ${st.pending} 张` : '没在跑');
     return [
       `看屏幕：${cap}`,
+      // 总开关要放在第一行看得见的位置：`/seenow status` 就是用户"它怎么不动了"第一眼看的地方
+      `总开关：${st.enabled ? '开' : '**关**（你自己关的；/seenow on 才能打开）'}`,
       windowLine(),
       `循环：${lp
         ? (lp.stopped
@@ -1281,6 +1329,22 @@ async function registerAll(ctx) {
           signal: run?.signal ?? null,
         });
         if (!r.ok) {
+          /**
+           * 用户关掉了「屏幕读取总开关」（issue #77）。
+           *
+           * 这句话要说死三件事：不是故障、重试没用、**你没有权限打开它**。
+           * 不写第三条的话，模型会去翻别的 action 找绕过的路（`window show` / `region`），
+           * 而那些路全都是白跑 —— 闸在 runner 的 `guardReason` 里，比它们都早。
+           */
+          if (r.reason === 'disabled-by-user') {
+            return {
+              text: '用户关掉了「屏幕读取」总开关，现在不许采集屏幕。\n'
+                + '**这不是故障，也不要重试、更不要换参数绕开** —— 闸在你调不动的层。\n'
+                + '能打开它的只有用户自己：设置页的开关，或者 `/seenow on`。\n'
+                + '想继续看就直接请他打开；在那之前别再说"我在看着你"。',
+              meta: { ok: false, reason: 'disabled-by-user', enabled: false },
+            };
+          }
           // 用户关过窗：**只有他重新要求看，才允许再开**。这一条以前只靠工具描述
           // 里的一句"别再调了"，模型不照做就会把窗重新弹出来。
           if (r.reason === 'hung-up') {
@@ -1373,6 +1437,18 @@ async function registerAll(ctx) {
       }
 
       if (action === 'peek') {
+        /**
+         * 总开关关掉时**不能落到下面那句"手上还没有画面"**：
+         * 那句话会把责任推给"还没攒到"，模型于是继续等、继续 peek（issue #77）。
+         * 和 `watch` 的分支共用同一套说法，免得同一个状态两处口径不一致。
+         */
+        if (!runner.enabled()) {
+          return {
+            text: '用户关掉了「屏幕读取」总开关，现在没有画面可给。\n'
+              + '**别重试** —— 只有用户自己能打开（设置页的开关 / `/seenow on`）。',
+            meta: { ok: false, reason: 'disabled-by-user', enabled: false },
+          };
+        }
         const s = runner.peek();
         const st = runner.status();
         // 走 peek 路线的会话也要有循环：不然模型摘完这一张就结束，没人再叫它。
@@ -1401,6 +1477,14 @@ async function registerAll(ctx) {
       }
 
       if (action === 'start') {
+        // 总开关优先于一切参数：关掉了就不解析 src、不碰采集（issue #77）
+        if (!runner.enabled()) {
+          return {
+            text: '用户关掉了「屏幕读取」总开关，起不了采集。\n'
+              + '**别重试** —— 只有用户自己能打开（设置页的开关 / `/seenow on`）。',
+            meta: { ok: false, reason: 'disabled-by-user', enabled: false },
+          };
+        }
         const built = srcOf(args);
         if (built.error) return { text: built.error, meta: { ok: false, reason: built.reason ?? 'bad-region' } };
         const r = await runner.start({ src: built.src ?? { kind: 'screen' } });
@@ -1592,7 +1676,11 @@ async function registerAll(ctx) {
         const estKTok = Math.round(sheets * 222 / 1000);
         const estMB = Math.round(sheets * 130 / 1024);
         return {
-          text: (s.running
+          text: (s.enabled
+            ? ''
+            : '⛔ 屏幕读取：**已被用户关掉**（这是他的总开关，不是故障）。\n'
+              + '   采集与取图全都停了；只有他能打开 —— 设置页那一格，或 `/seenow on`。\n')
+            + (s.running
             ? `在看 ${s.source?.kind}${s.source?.engine === 'portal' ? '/portal' : ''} @${s.size?.[0]}×${s.size?.[1]}（${s.quality}，${s.since}s，收到 ${s.frames} 帧，留帧 ${s.stats?.kept ?? 0}，出图 ${s.stats?.sheets ?? 0}）`
               + `${s.lastError ? `\n⚠ ${s.lastError}` : ''}`
             : `没在采集（${s.idleSec}s 前停的）${s.lastError ? `\n⚠ ${s.lastError}` : ''}`)
@@ -1715,6 +1803,8 @@ async function registerAll(ctx) {
       getLoop: () => loop,
       stopLoop: (reason) => stopLoop(reason),
       statusText: () => statusSummary(),
+      // 总开关（issue #77）：命令是用户侧入口，所以能改，而且**落盘**
+      setScreenEnabled: (next) => applyEnabled(next),
     });
     if (disposeCmd) {
       disposers.push(disposeCmd);
