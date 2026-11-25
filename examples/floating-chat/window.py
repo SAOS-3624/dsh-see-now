@@ -591,6 +591,11 @@ class LiveGlass:
 
         self.feed = ChatFeed(CHAT_FILE)
         self._mic_proc = None
+        # 这次开麦的 stderr 末几行（**只在内存**：mic.py 每识别一句都会打一行，
+        # 落盘等于把用户说的话全存下来）。麦挂掉时把原因搬进状态栏。
+        self._mic_lines = []
+        # 「用户主动停」vs「它自己崩了」—— 两者都表现为子进程退出，混在一起就只能猜
+        self._mic_stopping = False
         self._protocol = WindowProtocol() if WindowProtocol is not None else None
         self._collapsed = False
         # ⏸ 暂停（只停采集、窗留着）。**不落盘**：窗口重启后按"在看"处理 ——
@@ -985,9 +990,10 @@ class LiveGlass:
             for event in self._drain_protocol():
                 self._render_event(event)
             if self._mic_proc is not None and self._mic_proc.poll() is not None:
-                self._mic_proc = None
-                self.feed.status = ""
-                self._refresh_feed()
+                # **不要在这里直接清场**（issue #66）：这个轮询每 250ms 跑一遍，
+                # 清了之后没人知道子进程是"用户停的"还是"它自己崩的"，
+                # 崩溃原因就算写进 status 也会在 250ms 内被抹掉。
+                self._on_mic_exit()
             if self.feed.poll():
                 self._collapse_expanded()
                 self._refresh_feed()
@@ -1161,18 +1167,74 @@ class LiveGlass:
                 si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 si.wShowWindow = subprocess.SW_HIDE
                 flags = 0x08000000          # CREATE_NO_WINDOW
+            self._mic_lines = []
+            self._mic_stopping = False
+            # `stderr=PIPE` 而不是 DEVNULL：以前退出原因全丢，用户看到的是"点了没反应"（#66）。
+            # 也不能落盘 —— mic.py 每识别一句就打一行，写文件等于把语音转写存本地。
             self._mic_proc = subprocess.Popen(
                 [asr_python(), str(MIC_SCRIPT), "--engine", "local"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                 creationflags=flags, startupinfo=si,
             )
+            threading.Thread(target=self._pump_mic_stderr,
+                             args=(self._mic_proc,), daemon=True).start()
             self.feed.status = "录音中"
         except Exception as exc:
             self.feed.status = f"麦起不来：{exc}"
         self._refresh_feed()
 
+    def _pump_mic_stderr(self, p) -> None:
+        """盯着 mic.py 的 stderr，只在内存里留最后 20 行。
+
+        **跳过 `识别` 开头的那几行**：那是用户语音的转写内容，不该出现在状态栏、
+        更不该留在任何地方。
+        """
+        try:
+            for raw in iter(p.stderr.readline, b""):
+                line = raw.decode("utf-8", "replace").strip()
+                if not line or line.startswith("识别"):
+                    continue
+                if p is not self._mic_proc:
+                    break                   # 已经换了一次开麦，别往新缓冲里塞旧日志
+                self._mic_lines.append(line)
+                del self._mic_lines[:-20]
+        except Exception:
+            pass
+
+    def _on_mic_exit(self) -> None:
+        """mic.py 退出了：分清"用户停的"和"它自己崩的"，后者把原因放到状态栏。
+
+        为什么接管这条已有路径而不是另起一个定时器：`_poll_chat` 每 250ms 跑，
+        任何"1.5 秒后再查"的写法都会在检查之前被它清掉 `_mic_proc`，
+        于是崩溃被误判成手动停止（第一版就是这么写的，根本触发不了）。
+        """
+        p = self._mic_proc
+        self._mic_proc = None
+        if self._mic_stopping:
+            self._mic_stopping = False
+            self.feed.status = ""
+            self._refresh_feed()
+            return
+        code = None if p is None else p.returncode
+        reason = ""
+        for line in reversed(self._mic_lines):
+            # 关键词要覆盖 mic.py 真正会说的那几句：「模型不完整 … 缺 X」「找不到 ASR 模型」
+            # 「缺依赖」「挂了」「转写失败」。漏一个就退化成只报退出码，白做。
+            if any(k in line for k in
+                   ("缺", "找不到", "模型不完整", "Error", "Traceback", "Exception", "failed", "挂了")):
+                reason = line
+                break
+        # **不能拿末行兜底当原因**：正常时它是"本地模型就绪 1.4s"这种，
+        # 显示成"麦没起来：本地模型就绪"比不说还糟。宁可只报退出码。
+        self.feed.status = (
+            f"麦没起来：{reason[:120]}" if reason
+            else f"麦没起来（退出码 {code}；终端跑 python mic.py --engine local 看原因）"
+        )
+        self._refresh_feed()
+
     def _stop_mic(self):
         p = self._mic_proc
+        self._mic_stopping = True       # 先说清是"我要停"，否则 _on_mic_exit 会报成崩溃
         self._mic_proc = None
         self.feed.status = ""
         if p is not None and p.poll() is None:

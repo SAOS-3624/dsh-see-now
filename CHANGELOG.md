@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.9] - 2026-11-25
+
+### Fixed — 麦克风：模型目录不再写死，启动失败也看得见了（跟着 watch-together 0.3.7）
+
+本包的 `examples/floating-chat/{window,mic}.py` 是 watch-together 那份的同步副本。
+upstream 修了 #66（单 C 盘机器上点 🎤 完全没反应），这里跟着同步 —— **本包没有自己的改动**。
+
+不跟着发的话，只装 see-now 的用户仍然会撞上那三层：`mic.py` 写死
+`D:/asr-local/models-sherpa`、`window.py` 把子进程 stderr 丢掉、250ms 轮询又把状态清空。
+
+细节看 watch-together 0.3.7 的 CHANGELOG。同步方式：`node scripts/sync-window.mjs`
+（`prepack` 也会跑）。
+
 ## [0.2.8] - 2026-11-24
 
 ### Fixed — 常驻文案超预算（0.2.7 的收尾）
